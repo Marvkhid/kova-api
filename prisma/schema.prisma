@@ -1,0 +1,194 @@
+// ============================================================
+// KOVA — Prisma Schema
+// Full marketplace database schema.
+// Run: npx prisma migrate dev --name init
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Users ─────────────────────────────────────────────────
+
+model User {
+  id            String    @id @default(cuid())
+  clerkId       String    @unique  // Clerk user ID
+  email         String    @unique
+  name          String?
+  avatarUrl     String?
+  bio           String?
+  role          Role      @default(BUYER)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // Relations
+  products      Product[]
+  orders        Order[]
+  reviews       Review[]
+  sellerProfile SellerProfile?
+
+  @@map("users")
+}
+
+enum Role {
+  BUYER
+  SELLER
+  ADMIN
+}
+
+// ── Seller Profile ────────────────────────────────────────
+
+model SellerProfile {
+  id            String    @id @default(cuid())
+  userId        String    @unique
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  storeName     String
+  storeSlug     String    @unique
+  description   String?
+  logoUrl       String?
+  bannerUrl     String?
+  totalSales    Int       @default(0)
+  totalRevenue  Float     @default(0)
+  rating        Float     @default(0)
+  reviewCount   Int       @default(0)
+  isVerified    Boolean   @default(false)
+  payoutEmail   String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@map("seller_profiles")
+}
+
+// ── Products ──────────────────────────────────────────────
+
+model Product {
+  id            String          @id @default(cuid())
+  name          String
+  slug          String          @unique
+  description   String
+  price         Float
+  originalPrice Float?
+  category      ProductCategory
+  badge         ProductBadge?
+  tags          String[]
+  images        String[]        // Cloudinary URLs
+  inStock       Boolean         @default(true)
+  isPublished   Boolean         @default(true)
+  rating        Float           @default(0)
+  reviewCount   Int             @default(0)
+  buyCount      Int             @default(0)
+  viewCount     Int             @default(0)
+  sellerId      String
+  seller        User            @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  // Relations
+  orderItems    OrderItem[]
+  reviews       Review[]
+  cartItems     CartItem[]
+
+  @@map("products")
+}
+
+enum ProductCategory {
+  FASHION
+  DIGITAL
+  SERVICES
+  PHYSICAL
+  ART
+  COURSES
+}
+
+enum ProductBadge {
+  NEW
+  HOT
+  SALE
+}
+
+// ── Orders ────────────────────────────────────────────────
+
+model Order {
+  id              String        @id @default(cuid())
+  orderNumber     String        @unique @default(cuid())
+  userId          String
+  user            User          @relation(fields: [userId], references: [id])
+  status          OrderStatus   @default(PENDING)
+  paymentStatus   PaymentStatus @default(UNPAID)
+  paymentRef      String?       // Paystack reference
+  subtotal        Float
+  shipping        Float         @default(0)
+  total           Float
+  shippingAddress Json?
+  items           OrderItem[]
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@map("orders")
+}
+
+enum OrderStatus {
+  PENDING
+  PROCESSING
+  SHIPPED
+  DELIVERED
+  CANCELLED
+  REFUNDED
+}
+
+enum PaymentStatus {
+  UNPAID
+  PAID
+  REFUNDED
+  FAILED
+}
+
+model OrderItem {
+  id          String   @id @default(cuid())
+  orderId     String
+  order       Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id])
+  quantity    Int
+  price       Float    // price at time of purchase
+  createdAt   DateTime @default(now())
+
+  @@map("order_items")
+}
+
+// ── Cart ──────────────────────────────────────────────────
+
+model CartItem {
+  id        String   @id @default(cuid())
+  sessionId String   // guest cart session
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  quantity  Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([sessionId, productId])
+  @@map("cart_items")
+}
+
+// ── Reviews ───────────────────────────────────────────────
+
+model Review {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  rating    Int      // 1-5
+  comment   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, productId]) // one review per user per product
+  @@map("reviews")
+}
