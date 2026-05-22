@@ -15,9 +15,11 @@ import {
   UploadedFiles,
 } from '@nestjs/common';
 import { FileInterceptor, FilesInterceptor } from '@nestjs/platform-express';
+import { MulterOptions } from '@nestjs/platform-express/multer/interfaces/multer-options.interface';
 import { ConfigService } from '@nestjs/config';
 import { v2 as cloudinary, UploadApiResponse } from 'cloudinary';
-import { JwtAuthGuard } from '../auth/auth.module';
+import { FileFilterCallback, memoryStorage } from 'multer';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 
 // ── Service ───────────────────────────────────────────────
 
@@ -87,15 +89,18 @@ export class UploadsService {
 
 // ── Multer config (memory storage) ───────────────────────
 
-const multerConfig = {
-  storage: undefined, // memory storage — buffer used for Cloudinary
+const multerConfig: MulterOptions = {
+  storage: memoryStorage(), // memory storage — buffer used for Cloudinary
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB max
-  fileFilter: (_req: any, file: Express.Multer.File, cb: Function) => {
-    if (!file.mimetype.startsWith('image/')) {
-      cb(new BadRequestException('Only image files are allowed'), false);
-    } else {
-      cb(null, true);
+  fileFilter: (
+    _req,
+    file: Parameters<NonNullable<MulterOptions['fileFilter']>>[1],
+    cb: FileFilterCallback,
+  ) => {
+    if (!file.mimetype?.startsWith('image/')) {
+      return cb(new BadRequestException('Only image files are allowed'));
     }
+    cb(null, true);
   },
 };
 

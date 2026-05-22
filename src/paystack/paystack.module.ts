@@ -22,8 +22,9 @@ import { IsNumber, IsString, Min } from 'class-validator';
 import { Type } from 'class-transformer';
 import { createHmac } from 'crypto';
 import { PrismaService } from '../prisma/prisma.module';
-import { OrdersService } from '../orders/orders.module';
-import { JwtAuthGuard, CurrentUser } from '../auth/auth.module';
+import { OrdersModule, OrdersService } from '../orders/orders.module';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { CurrentUser } from '../auth/current-user.decorator';
 import type { Request } from 'express';
 
 // ── DTOs ──────────────────────────────────────────────────
@@ -31,7 +32,7 @@ import type { Request } from 'express';
 export class InitializePaymentDto {
   @IsString() orderId: string;
   @IsString() email: string;
-  @IsNumber() @Min(1) @Type(() => Number) amount: number; // in kobo (NGN) or cents
+  @IsNumber() @Min(1) @Type(() => Number) amount: number; // currently not trusted; DB total used
 }
 
 // ── Service ───────────────────────────────────────────────
@@ -67,7 +68,7 @@ export class PaystackService {
         amount: Math.round(order.total * 100), // convert to kobo
         reference: `kova-${order.id}-${Date.now()}`,
         metadata: { orderId: order.id, userId },
-        callback_url: `${this.config.get('FRONTEND_URL')}/orders?ref={FLWREF}`,
+        callback_url: `${this.config.get('FRONTEND_URL')}/orders`,
       }),
     });
 
@@ -122,6 +123,7 @@ export class PaystackService {
         }
         break;
       }
+
       case 'refund.processed': {
         const { metadata } = event.data;
         if (metadata?.orderId) {
@@ -173,7 +175,7 @@ export class PaystackController {
 // ── Module ────────────────────────────────────────────────
 
 @Module({
-  imports: [],
+  imports: [OrdersModule],
   providers: [PaystackService],
   controllers: [PaystackController],
   exports: [PaystackService],

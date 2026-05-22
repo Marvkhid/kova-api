@@ -86,7 +86,8 @@ export class UsersService {
 // ── Controller ────────────────────────────────────────────
 
 import { Controller, Get, Patch, Body, UseGuards } from '@nestjs/common';
-import { JwtAuthGuard, CurrentUser } from '../auth/auth.module';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard'
+import { CurrentUser } from '../auth/current-user.decorator';
 
 @Controller('users')
 @UseGuards(JwtAuthGuard)

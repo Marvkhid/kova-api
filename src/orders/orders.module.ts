@@ -26,7 +26,8 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { PrismaService } from '../prisma/prisma.module';
-import { JwtAuthGuard, CurrentUser } from '../auth/auth.module';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { CurrentUser } from '../auth/current-user.decorator';
 
 // ── DTOs ──────────────────────────────────────────────────
 
@@ -132,6 +133,16 @@ export class OrdersService {
     });
     if (!order) throw new NotFoundException('Order not found');
 
+    // Prevent double-confirming paid orders
+    if (order.paymentStatus === 'PAID') {
+      return this.prisma.order.findUnique({
+        where: { id: orderId },
+        include: {
+          items: { include: { product: true } },
+        },
+      });
+    }
+
     // Update order to paid + processing
     const updated = await this.prisma.order.update({
       where: { id: orderId },
@@ -189,7 +200,7 @@ export class OrdersController {
     return this.orders.findOne(id, user.id);
   }
 
-  // POST /api/orders/verify-payment — confirm Paystack payment
+  // POST /api/orders/verify-payment — confirm payment
   @Post('verify-payment')
   verifyPayment(@Body() dto: VerifyPaymentDto) {
     return this.orders.confirmPayment(dto.orderId, dto.reference);
