@@ -7,13 +7,25 @@
   "license": "MIT",
   "scripts": {
     "build": "nest build",
-    "start": "node dist/src/main",
+
+    "start": "npm run start:prod",
+
+    "start:prod": "npx prisma generate && npx prisma migrate deploy && node dist/src/main.js",
+
     "start:dev": "nest start --watch",
+
     "start:debug": "nest start --debug --watch",
+
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\"",
+
     "db:generate": "prisma generate",
-    "db:migrate": "prisma migrate dev",
+
+    "db:migrate": "prisma migrate dev --name",
+
+    "db:deploy": "prisma migrate deploy",
+
     "db:studio": "prisma studio",
+
     "db:seed": "ts-node prisma/seed.ts"
   },
   "dependencies": {

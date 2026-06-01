@@ -14,7 +14,7 @@ async function bootstrap() {
 
   // CORS — allow requests from Next.js frontend
   app.enableCors({
-    origin: process.env.FRONTEND_URL || 'http://kova-wgcb.vercel.app',
+    origin: process.env.FRONTEND_URL || 'http://kova-shopp.vercel.app',
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   });
@@ -32,7 +32,7 @@ async function bootstrap() {
   );
 
   const port = process.env.PORT || 3001;
-  await app.listen(port);
+  await app.listen(port, '0.0.0.0');
   console.log(`🚀 KOVA API running on http://localhost:${port}/api`);
 }
 
