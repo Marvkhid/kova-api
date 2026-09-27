@@ -1,7 +1,13 @@
 // ============================================================
-// KOVA — Prisma Schema
-// Full marketplace database schema.
-// Run: npx prisma migrate dev --name init
+// KOVA — Prisma Schema (Marketplace v3)
+// v3 additions:
+//   • Money as Decimal(12,2) — no float arithmetic for Naira
+//   • OrderEvent: append-only fulfillment timeline (source of truth)
+//   • OrderItem.fulfillmentStatus: per-item physical/digital lifecycle
+//   • SellerReview: separate seller reputation (1-5 + dimensions)
+//   • Review.verifiedPurchase: computed server-side from order data
+//   • Review title + admin moderation (ReviewStatus)
+// Run: npx prisma migrate dev --name marketplace_v3
 // ============================================================
 
 generator client {
@@ -16,21 +22,26 @@ datasource db {
 // ── Users ─────────────────────────────────────────────────
 
 model User {
-  id            String    @id @default(cuid())
-  clerkId       String    @unique  // Clerk user ID
-  email         String    @unique
-  name          String?
-  avatarUrl     String?
-  bio           String?
-  role          Role      @default(BUYER)
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  id        String   @id @default(cuid())
+  clerkId   String   @unique // Clerk user ID ("local:<email>" for email+password accounts)
+  email     String   @unique
+  // bcrypt hash for email+password accounts (null = Clerk-only account)
+  passwordHash String?
+  name      String?
+  avatarUrl String?
+  bio       String?
+  role      Role     @default(BUYER)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   // Relations
-  products      Product[]
-  orders        Order[]
-  reviews       Review[]
-  sellerProfile SellerProfile?
+  products         Product[]
+  orders           Order[]
+  reviews          Review[]
+  sellerReviewsReceived SellerReview[] @relation("SellerReviewsReceived")
+  sellerReviewsGiven    SellerReview[] @relation("SellerReviewsGiven")
+  sellerProfile    SellerProfile?
+  wishlistItems    WishlistItem[]
 
   @@map("users")
 }
@@ -44,65 +55,93 @@ enum Role {
 // ── Seller Profile ────────────────────────────────────────
 
 model SellerProfile {
-  id            String    @id @default(cuid())
-  userId        String    @unique
-  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  storeName     String
-  storeSlug     String    @unique
-  description   String?
-  logoUrl       String?
-  bannerUrl     String?
-  totalSales    Int       @default(0)
-  totalRevenue  Float     @default(0)
-  rating        Float     @default(0)
-  reviewCount   Int       @default(0)
-  isVerified    Boolean   @default(false)
-  payoutEmail   String?
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  storeName   String
+  storeSlug   String   @unique
+  description String?
+  // Nigerian state/city for the public store page — demo seeds use
+  // fictional-but-plausible locations. No street addresses stored.
+  location    String?
+  logoUrl     String?
+  bannerUrl   String?
+  isVerified  Boolean  @default(false)
+  payoutEmail String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
   @@map("seller_profiles")
+}
+
+// ── Categories (database-driven) ──────────────────────────
+
+model Category {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  description String?
+  icon        String? // short identifier used by the UI (e.g. "fashion")
+  sortOrder   Int      @default(0)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  products Product[]
+
+  @@map("categories")
 }
 
 // ── Products ──────────────────────────────────────────────
 
 model Product {
-  id            String          @id @default(cuid())
+  id            String        @id @default(cuid())
   name          String
-  slug          String          @unique
+  slug          String        @unique // generated once at creation — stable for QR codes
   description   String
-  price         Float
-  originalPrice Float?
-  category      ProductCategory
+  // Decimal(12,2): exact Naira + kobo, no float rounding errors.
+  // Prisma returns Decimal; serialize with toNumber()/toString().
+  price         Decimal       @db.Decimal(12, 2)
+  originalPrice Decimal?      @db.Decimal(12, 2)
+  productType   ProductType   @default(PHYSICAL)
+  status        ProductStatus @default(DRAFT)
   badge         ProductBadge?
   tags          String[]
-  images        String[]        // Cloudinary URLs
-  inStock       Boolean         @default(true)
-  isPublished   Boolean         @default(true)
-  rating        Float           @default(0)
-  reviewCount   Int             @default(0)
-  buyCount      Int             @default(0)
-  viewCount     Int             @default(0)
+  images        String[] // ordered image URLs — index 0 is the primary image
+  inStock       Boolean       @default(true)
+  rating        Float         @default(0) // aggregate from Review rows (rounded 0.1)
+  reviewCount   Int           @default(0) // aggregate from Review rows
+  buyCount      Int           @default(0) // aggregate from paid OrderItems
+  viewCount     Int           @default(0)
   sellerId      String
-  seller        User            @relation(fields: [sellerId], references: [id], onDelete: Cascade)
-  createdAt     DateTime        @default(now())
-  updatedAt     DateTime        @updatedAt
+  seller        User          @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  categoryId    String?
+  category      Category?     @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
 
   // Relations
   orderItems    OrderItem[]
   reviews       Review[]
   cartItems     CartItem[]
+  wishlistItems WishlistItem[]
 
+  @@index([status, createdAt])
+  @@index([sellerId])
+  @@index([categoryId])
   @@map("products")
 }
 
-enum ProductCategory {
-  FASHION
-  DIGITAL
-  SERVICES
+enum ProductType {
   PHYSICAL
-  ART
-  COURSES
+  DIGITAL
+}
+
+enum ProductStatus {
+  DRAFT
+  PUBLISHED
+  UNPUBLISHED
+  REMOVED
 }
 
 enum ProductBadge {
@@ -111,31 +150,52 @@ enum ProductBadge {
   SALE
 }
 
+// ── Wishlist ──────────────────────────────────────────────
+
+model WishlistItem {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, productId])
+  @@map("wishlist_items")
+}
+
 // ── Orders ────────────────────────────────────────────────
 
 model Order {
-  id              String        @id @default(cuid())
-  orderNumber     String        @unique @default(cuid())
-  userId          String
-  user            User          @relation(fields: [userId], references: [id])
-  status          OrderStatus   @default(PENDING)
-  paymentStatus   PaymentStatus @default(UNPAID)
-  paymentRef      String?       // Paystack reference
-  subtotal        Float
-  shipping        Float         @default(0)
-  total           Float
+  id             String        @id @default(cuid())
+  orderNumber    String        @unique @default(cuid())
+  userId         String
+  user           User          @relation(fields: [userId], references: [id])
+  status         OrderStatus   @default(PENDING)
+  paymentStatus  PaymentStatus @default(UNPAID)
+  paymentRef     String? // Paystack reference
+  subtotal       Decimal       @db.Decimal(12, 2)
+  shipping       Decimal       @default(0) @db.Decimal(12, 2)
+  total          Decimal       @db.Decimal(12, 2)
+  // Demo seeds use Nigerian city/state only — no real private addresses.
   shippingAddress Json?
-  items           OrderItem[]
-  createdAt       DateTime      @default(now())
-  updatedAt       DateTime      @updatedAt
+  items          OrderItem[]
+  events         OrderEvent[]
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
 
+  @@index([userId, createdAt])
   @@map("orders")
 }
 
 enum OrderStatus {
   PENDING
+  PAID
   PROCESSING
+  PACKED
   SHIPPED
+  IN_TRANSIT
+  OUT_FOR_DELIVERY
   DELIVERED
   CANCELLED
   REFUNDED
@@ -148,24 +208,60 @@ enum PaymentStatus {
   FAILED
 }
 
+// Per-item fulfillment lifecycle — a mixed physical+digital order
+// progresses independently per item type.
 model OrderItem {
-  id          String   @id @default(cuid())
-  orderId     String
-  order       Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  productId   String
-  product     Product  @relation(fields: [productId], references: [id])
-  quantity    Int
-  price       Float    // price at time of purchase
-  createdAt   DateTime @default(now())
+  id                String                 @id @default(cuid())
+  orderId           String
+  order             Order                  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId         String
+  product           Product                @relation(fields: [productId], references: [id])
+  quantity          Int
+  // Price locked at purchase time (Decimal — matches product schema)
+  price             Decimal                @db.Decimal(12, 2)
+  fulfillmentStatus FulfillmentStatus      @default(PENDING)
+  trackingNumber    String? // internal tracking code — never fabricated
+  carrier           String? // logistics partner label where actually assigned
+  createdAt         DateTime               @default(now())
+  updatedAt         DateTime               @updatedAt
 
+  @@index([orderId])
+  @@index([productId])
   @@map("order_items")
+}
+
+enum FulfillmentStatus {
+  PENDING
+  PAID
+  PROCESSING
+  PACKED
+  SHIPPED
+  IN_TRANSIT
+  OUT_FOR_DELIVERY
+  DELIVERED
+  CANCELLED
+}
+
+// Append-only timeline. Every status change writes a row here.
+// The buyer-facing tracking UI renders ONLY from these events —
+// nothing is animated or inferred client-side.
+model OrderEvent {
+  id        String   @id @default(cuid())
+  orderId   String
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  status    OrderStatus
+  message   String? // optional human note (e.g. "Handed to GIG Logistics")
+  createdAt DateTime @default(now())
+
+  @@index([orderId, createdAt])
+  @@map("order_events")
 }
 
 // ── Cart ──────────────────────────────────────────────────
 
 model CartItem {
   id        String   @id @default(cuid())
-  sessionId String   // guest cart session
+  sessionId String // guest cart session
   productId String
   product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
   quantity  Int      @default(1)
@@ -176,19 +272,57 @@ model CartItem {
   @@map("cart_items")
 }
 
-// ── Reviews ───────────────────────────────────────────────
+// ── Product Reviews ───────────────────────────────────────
 
 model Review {
-  id        String   @id @default(cuid())
+  id        String       @id @default(cuid())
   userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   productId String
-  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
-  rating    Int      // 1-5
+  product   Product      @relation(fields: [productId], references: [id], onDelete: Cascade)
+  rating    Int // 1-5
+  title     String?
   comment   String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  // Set by the SERVER by checking real OrderItems — never trusted
+  // from the client. true only when a PAID order links this user
+  // to this product.
+  verifiedPurchase Boolean @default(false)
+  status    ReviewStatus @default(VISIBLE)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
 
   @@unique([userId, productId]) // one review per user per product
+  @@index([productId, status, createdAt])
   @@map("reviews")
+}
+
+enum ReviewStatus {
+  VISIBLE
+  HIDDEN // admin-moderated (auditable via updatedAt)
+}
+
+// ── Seller Reviews (reputation) ───────────────────────────
+
+model SellerReview {
+  id          String   @id @default(cuid())
+  // The store being rated
+  sellerUserId String
+  seller      User     @relation("SellerReviewsReceived", fields: [sellerUserId], references: [id], onDelete: Cascade)
+  // The buyer who rated
+  authorId    String
+  author      User     @relation("SellerReviewsGiven", fields: [authorId], references: [id], onDelete: Cascade)
+  rating      Int // 1-5 overall
+  // Optional experience dimensions (1-5 each)
+  communication Int?
+  productAccuracy Int?
+  packaging     Int?
+  deliveryExperience Int?
+  comment     String?
+  status      ReviewStatus @default(VISIBLE)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([sellerUserId, authorId]) // one seller review per buyer per store
+  @@index([sellerUserId, status])
+  @@map("seller_reviews")
 }

@@ -1,59 +1,38 @@
 // ============================================================
 // KOVA API — Auth Module
-// Verifies Clerk JWT tokens on protected routes.
+// Session verification via the official Clerk SDK + role guard,
+// plus the first-party email+password auth path (LocalAuthService).
 // ============================================================
 
-import { Module, Injectable } from '@nestjs/common';
-import { PassportModule } from '@nestjs/passport';
-import { PassportStrategy } from '@nestjs/passport';
-import { ExtractJwt, Strategy } from 'passport-jwt';
-import { ConfigService } from '@nestjs/config';
-import { UsersService } from '../users/users.service';
-import { UsersModule } from '../users/users.module';
+import { Global, Module } from '@nestjs/common';
+import { JwtModule } from '@nestjs/jwt';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { AuthService } from './auth.service';
+import { LocalAuthService } from './local-auth.service';
+import { LocalAuthController } from './local-auth.controller';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
+import { RolesGuard } from './guards/roles.guard';
+import { UsersModule } from '../users/users.module';
 
-// ── JWT Payload from Clerk ────────────────────────────────
-
-export interface ClerkJwtPayload {
-  sub: string; // Clerk user ID
-  email: string;
-  name?: string;
-}
-
-// ── JWT Strategy ──────────────────────────────────────────
-
-@Injectable()
-export class ClerkJwtStrategy extends PassportStrategy(Strategy, 'clerk-jwt') {
-  constructor(
-    private config: ConfigService,
-    private users: UsersService,
-  ) {
-    super({
-      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
-      secretOrKey: config.get<string>('JWT_SECRET'),
-      ignoreExpiration: false,
-    });
-  }
-
-  async validate(payload: ClerkJwtPayload) {
-    // Find or create user in our DB from Clerk token
-    const user = await this.users.findOrCreate({
-      clerkId: payload.sub,
-      email: payload.email,
-      name: payload.name,
-    });
-    return user;
-  }
-}
-
-// ── Auth Module ───────────────────────────────────────────
-
+// Global: JwtAuthGuard is applied with @UseGuards(ClassRef) across many
+// feature modules; Nest instantiates it in the *consuming* module's
+// context, so AuthService must be resolvable app-wide, not just where
+// AuthModule is imported.
+@Global()
 @Module({
   imports: [
-    PassportModule.register({ defaultStrategy: 'clerk-jwt' }),
     UsersModule,
+    JwtModule.registerAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        secret: config.get<string>('JWT_SECRET'),
+        signOptions: { expiresIn: config.get<string>('JWT_EXPIRES_IN', '7d') },
+      }),
+    }),
   ],
-  providers: [ClerkJwtStrategy, JwtAuthGuard],
-  exports: [JwtAuthGuard, ClerkJwtStrategy],
+  controllers: [LocalAuthController],
+  providers: [AuthService, LocalAuthService, JwtAuthGuard, RolesGuard],
+  exports: [AuthService, LocalAuthService, JwtAuthGuard, RolesGuard],
 })
 export class AuthModule {}

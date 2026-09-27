@@ -1,107 +1,217 @@
 // ============================================================
 // KOVA API — Products Module
-// CRUD for products. Public reads, auth required for writes.
+// Marketplace product lifecycle:
+//   create (DRAFT) → publish (validated) → unpublish → delete
+// Server-side enforcement:
+//   • Ownership: a seller can only mutate their own listings
+//   • PHYSICAL products require >= 3 images to publish
+//   • Only PUBLISHED products are publicly discoverable
+//   • Slugs are generated once and never change (stable QR URLs)
 // ============================================================
 
 import {
-  Injectable,
-  NotFoundException,
-  ForbiddenException,
-  Module,
-  Controller,
-  Get,
-  Post,
-  Patch,
-  Delete,
+  BadRequestException,
   Body,
+  Controller,
+  Delete,
+  ForbiddenException,
+  Get,
+  Injectable,
+  Module,
+  NotFoundException,
   Param,
+  Patch,
+  Post,
   Query,
   UseGuards,
 } from '@nestjs/common';
 import {
-  IsString,
-  IsNumber,
-  IsOptional,
-  IsEnum,
   IsArray,
   IsBoolean,
+  IsEnum,
+  IsNumber,
+  IsOptional,
+  IsString,
+  Max,
+  MaxLength,
   Min,
+  MinLength,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { PrismaService } from '../prisma/prisma.module';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { RolesGuard, Roles } from '../auth/guards/roles.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
+
+// ── Constants ─────────────────────────────────────────────
+
+export const MIN_PHYSICAL_IMAGES = 3;
+const RESERVED_ROUTE_PARAMS = new Set([
+  'featured', 'new', 'slug', 'seller', 'me',
+]);
 
 // ── DTOs ──────────────────────────────────────────────────
 
-enum ProductCategory {
-  FASHION = 'FASHION',
-  DIGITAL = 'DIGITAL',
-  SERVICES = 'SERVICES',
-  PHYSICAL = 'PHYSICAL',
-  ART = 'ART',
-  COURSES = 'COURSES',
-}
-enum ProductBadge {
-  NEW = 'NEW',
-  HOT = 'HOT',
-  SALE = 'SALE',
-}
-
 export class CreateProductDto {
-  @IsString() name: string;
-  @IsString() description: string;
+  @IsString()
+  @MinLength(3, { message: 'Product name must be at least 3 characters' })
+  @MaxLength(120)
+  name: string;
+
+  @IsString()
+  @MinLength(20, { message: 'Description must be at least 20 characters' })
+  @MaxLength(5000)
+  description: string;
+
   @IsNumber()
-  @Min(0)
+  @Min(0.01, { message: 'Price must be greater than zero' })
+  @Max(1_000_000)
   @Type(() => Number)
   price: number;
+
   @IsOptional()
   @IsNumber()
   @Min(0)
   @Type(() => Number)
   originalPrice?: number;
-  @IsEnum(ProductCategory) category: ProductCategory;
-  @IsOptional()
-  @IsEnum(ProductBadge)
-  badge?: ProductBadge;
+
+  @IsEnum({ PHYSICAL: 'PHYSICAL', DIGITAL: 'DIGITAL' })
+  productType: 'PHYSICAL' | 'DIGITAL';
+
+  @IsString()
+  categorySlug: string;
+
   @IsOptional()
   @IsArray()
   @IsString({ each: true })
+  @MaxLength(24, { each: true }) // per-tag cap (array form validated via IsArray)
   tags?: string[];
+
   @IsOptional()
   @IsArray()
   @IsString({ each: true })
   images?: string[];
+
+  @IsOptional()
+  @IsBoolean()
+  inStock?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  publish?: boolean; // true → publish immediately if the product validates
 }
 
 export class UpdateProductDto {
-  @IsOptional() @IsString() name?: string;
-  @IsOptional() @IsString() description?: string;
+  @IsOptional()
+  @IsString()
+  @MinLength(3)
+  @MaxLength(120)
+  name?: string;
+
+  @IsOptional()
+  @IsString()
+  @MinLength(20)
+  @MaxLength(5000)
+  description?: string;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0.01)
+  @Max(1_000_000)
+  @Type(() => Number)
+  price?: number;
+
   @IsOptional()
   @IsNumber()
   @Min(0)
   @Type(() => Number)
-  price?: number;
+  originalPrice?: number;
+
   @IsOptional()
-  @IsEnum(ProductCategory)
-  category?: ProductCategory;
+  @IsEnum({ PHYSICAL: 'PHYSICAL', DIGITAL: 'DIGITAL' })
+  productType?: 'PHYSICAL' | 'DIGITAL';
+
   @IsOptional()
-  @IsEnum(ProductBadge)
-  badge?: ProductBadge;
-  @IsOptional() @IsArray() tags?: string[];
-  @IsOptional() @IsArray() images?: string[];
-  @IsOptional() @IsBoolean() isPublished?: boolean;
+  @IsString()
+  categorySlug?: string;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  tags?: string[];
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  images?: string[];
+
+  @IsOptional()
+  @IsBoolean()
+  inStock?: boolean;
 }
 
 export class ProductQueryDto {
-  @IsOptional() @IsString() q?: string; // search query
-  @IsOptional() @IsString() category?: string;
+  @IsOptional() @IsString() q?: string;
+  @IsOptional() @IsString() category?: string; // category slug
+  @IsOptional() @IsString() type?: string;     // PHYSICAL | DIGITAL
   @IsOptional() @IsString() badge?: string;
-  @IsOptional() @IsString() seller?: string;
+  @IsOptional() @IsString() store?: string;    // seller store slug
   @IsOptional() @IsString() sort?: string;
-  @IsOptional() @Type(() => Number) @IsNumber() page?: number;
-  @IsOptional() @Type(() => Number) @IsNumber() limit?: number;
-  @IsOptional() @Type(() => Number) @IsNumber() maxPrice?: number;
+  @IsOptional() @Type(() => Number) @IsNumber() @Min(1) page?: number;
+  @IsOptional() @Type(() => Number) @IsNumber() @Min(1) @Max(50) limit?: number;
+  @IsOptional() @Type(() => Number) @IsNumber() @Min(0) maxPrice?: number;
+  @IsOptional() @Type(() => Number) @IsNumber() @Min(0) minPrice?: number;
+}
+
+// ── Helpers ───────────────────────────────────────────────
+
+/** Prisma Decimal → JSON-safe number (Naira, 2dp max). */
+export function money(value: unknown): number {
+  if (value === null || value === undefined) return 0;
+  return Number(value);
+}
+
+/** Convert a product's Decimal money fields to plain numbers. */
+function serializeProduct<T extends { price: unknown; originalPrice?: unknown }>(p: T): T {
+  return { ...p, price: money(p.price), originalPrice: p.originalPrice ? money(p.originalPrice) : null };
+}
+
+const PRODUCT_CARD_SELECT = {
+  id: true,
+  name: true,
+  slug: true,
+  price: true,
+  originalPrice: true,
+  productType: true,
+  status: true,
+  badge: true,
+  tags: true,
+  images: true,
+  inStock: true,
+  rating: true,
+  reviewCount: true,
+  buyCount: true,
+  viewCount: true,
+  createdAt: true,
+  categoryId: true,
+  category: { select: { name: true, slug: true } },
+  seller: {
+    select: {
+      id: true,
+      name: true,
+      avatarUrl: true,
+      sellerProfile: { select: { storeName: true, storeSlug: true } },
+    },
+  },
+};
+
+function slugify(name: string): string {
+  return name
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'product';
 }
 
 // ── Service ───────────────────────────────────────────────
@@ -110,84 +220,218 @@ export class ProductQueryDto {
 export class ProductsService {
   constructor(private prisma: PrismaService) {}
 
-  async findAll(query: ProductQueryDto) {
-    const {
-      q,
-      category,
-      badge,
-      seller,
-      sort = 'createdAt',
-      page = 1,
-      limit = 20,
-      maxPrice,
-    } = query;
+  /** Generate a unique slug once — never regenerated on rename. */
+  private async createUniqueSlug(name: string, productId?: string): Promise<string> {
+    const base = slugify(name);
+    let candidate = base;
+    let n = 2;
+    // Loop is bounded in practice; skip our own product when updating
+    // (not needed today — slugs are never regenerated).
+    while (true) {
+      const clash = await this.prisma.product.findUnique({
+        where: { slug: candidate },
+        select: { id: true },
+      });
+      if (!clash || clash.id === productId) return candidate;
+      candidate = `${base}-${n++}`;
+    }
+  }
 
-    const where: any = { isPublished: true };
+  /** Publish requirements — enforced server-side, never by the UI. */
+  private validateForPublish(product: {
+    name: string;
+    description: string;
+    price: unknown; // number or Prisma Decimal
+    categoryId: string | null;
+    productType: 'PHYSICAL' | 'DIGITAL';
+    images: string[];
+  }) {
+    const errors: string[] = [];
+    const price = money(product.price);
+    if (!product.name || product.name.trim().length < 3)
+      errors.push('Product name is required');
+    if (!product.description || product.description.trim().length < 20)
+      errors.push('A description of at least 20 characters is required');
+    if (!price || price <= 0)
+      errors.push('A valid price greater than zero is required');
+    if (!product.categoryId)
+      errors.push('A category is required');
 
-    // Search
-    if (q) {
+    if (product.productType === 'PHYSICAL') {
+      const usableImages = (product.images ?? []).filter(Boolean).length;
+      if (usableImages < MIN_PHYSICAL_IMAGES) {
+        errors.push(
+          `Physical products need at least ${MIN_PHYSICAL_IMAGES} images before publishing`,
+        );
+      }
+    }
+    return errors;
+  }
+
+  private buildWhere(query: ProductQueryDto) {
+    const { q, category, type, badge, store, maxPrice, minPrice } = query;
+    const where: any = { status: 'PUBLISHED' };
+
+    if (q && q.trim()) {
       where.OR = [
         { name: { contains: q, mode: 'insensitive' } },
         { description: { contains: q, mode: 'insensitive' } },
-        { tags: { has: q } },
+        { tags: { has: q.toLowerCase() } },
+        { seller: { sellerProfile: { storeName: { contains: q, mode: 'insensitive' } } } },
       ];
     }
-
-    if (category) where.category = category.toUpperCase();
+    if (category) where.category = { slug: category.toLowerCase() };
+    if (type) where.productType = type.toUpperCase();
     if (badge) where.badge = badge.toUpperCase();
-    if (maxPrice) where.price = { lte: maxPrice };
+    if (store) where.seller = { sellerProfile: { storeSlug: store } };
 
-    if (seller) {
-      where.seller = { name: { contains: seller, mode: 'insensitive' } };
-    }
+    const priceFilter: any = {};
+    if (minPrice !== undefined) priceFilter.gte = minPrice;
+    if (maxPrice !== undefined) priceFilter.lte = maxPrice;
+    if (Object.keys(priceFilter).length) where.price = priceFilter;
 
-    // Sort
-    const orderBy: any = {};
+    return where;
+  }
+
+  private buildOrder(sort?: string) {
     switch (sort) {
-      case 'price-asc':
-        orderBy.price = 'asc';
-        break;
-      case 'price-desc':
-        orderBy.price = 'desc';
-        break;
-      case 'rating':
-        orderBy.rating = 'desc';
-        break;
-      case 'popular':
-        orderBy.buyCount = 'desc';
-        break;
-      default:
-        orderBy.createdAt = 'desc';
+      case 'price-asc':  return { price: 'asc' as const };
+      case 'price-desc': return { price: 'desc' as const };
+      case 'rating':     return [{ rating: 'desc' as const }, { reviewCount: 'desc' as const }];
+      case 'popular':    return [{ buyCount: 'desc' as const }, { viewCount: 'desc' as const }];
+      case 'views':      return { viewCount: 'desc' as const };
+      case 'name':       return { name: 'asc' as const };
+      default:           return { createdAt: 'desc' as const }; // newest first
     }
+  }
+
+  async findAll(query: ProductQueryDto) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+    const where = this.buildWhere(query);
 
     const [products, total] = await Promise.all([
       this.prisma.product.findMany({
         where,
-        orderBy,
+        orderBy: this.buildOrder(query.sort),
         skip: (page - 1) * limit,
         take: limit,
-        include: {
-          seller: { select: { id: true, name: true, avatarUrl: true } },
-        },
+        select: PRODUCT_CARD_SELECT,
       }),
       this.prisma.product.count({ where }),
     ]);
 
-    return { products, total, page, limit, pages: Math.ceil(total / limit) };
+    return { products: products.map(serializeProduct), total, page, limit, pages: Math.ceil(total / limit) };
+  }
+
+  async getFeatured(limit = 8) {
+    const products = await this.prisma.product.findMany({
+      where: { status: 'PUBLISHED' },
+      orderBy: [{ buyCount: 'desc' }, { viewCount: 'desc' }],
+      take: limit,
+      select: PRODUCT_CARD_SELECT,
+    });
+    return products.map(serializeProduct);
+  }
+
+  /**
+   * Marketplace discovery — products drawn from MANY different sellers
+   * and categories for the homepage. Deterministic rotation from a
+   * large offset pool keeps the grid fresh between visits without
+   * fabricating anything: every candidate is a real published row.
+   */
+  async getDiscovery(limit = 20) {
+    const total = await this.prisma.product.count({ where: { status: 'PUBLISHED' } });
+    if (total === 0) return [];
+
+    // Day-changing offset + deterministic jitter rotates the pool daily
+    // while keeping a single render consistent.
+    const dayBucket = Math.floor(Date.now() / 86_400_000);
+    const jitter = (dayBucket * 2654435761) % 97;
+    const offset = total > limit * 3 ? (jitter * (total - limit * 3)) / 97 : 0;
+
+    const [a, b] = await Promise.all([
+      this.prisma.product.findMany({
+        where: { status: 'PUBLISHED' },
+        orderBy: { createdAt: 'desc' },
+        skip: Math.floor(offset),
+        take: limit,
+        select: PRODUCT_CARD_SELECT,
+      }),
+      // Guarantee multi-seller variety: top-rated picks appended from a
+      // different sort order so a sparse day still shows diverse sellers.
+      this.prisma.product.findMany({
+        where: { status: 'PUBLISHED', rating: { gte: 4 } },
+        orderBy: [{ reviewCount: 'desc' }, { buyCount: 'desc' }],
+        take: Math.ceil(limit / 2),
+        select: PRODUCT_CARD_SELECT,
+      }),
+    ]);
+
+    // Merge, de-dupe, then balance so one seller can't dominate the grid
+    const seen = new Set<string>();
+    const merged = [...a, ...b].filter((p) => {
+      if (seen.has(p.id)) return false;
+      seen.add(p.id);
+      return true;
+    });
+    const bySeller = new Map<string, number>();
+    const balanced: typeof merged = [];
+    for (const p of merged) {
+      const n = bySeller.get(p.seller.id) ?? 0;
+      if (n >= Math.max(2, Math.ceil(limit / 5))) continue;
+      bySeller.set(p.seller.id, n + 1);
+      balanced.push(p);
+    }
+    return balanced.slice(0, limit).map(serializeProduct);
+  }
+
+  /** New Arrivals — newest published listings first. */
+  async getNew(limit = 12) {
+    const products = await this.prisma.product.findMany({
+      where: { status: 'PUBLISHED' },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      select: PRODUCT_CARD_SELECT,
+    });
+    return products.map(serializeProduct);
+  }
+
+  /** Public product page by slug — the canonical URL QR codes point to. */
+  async findBySlug(slug: string) {
+    const product = await this.prisma.product.findUnique({
+      where: { slug },
+      select: {
+        ...PRODUCT_CARD_SELECT,
+        description: true,
+        updatedAt: true,
+        reviews: {
+          include: {
+            user: { select: { id: true, name: true, avatarUrl: true } },
+          },
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+        },
+      },
+    });
+    if (!product || product.status !== 'PUBLISHED') {
+      throw new NotFoundException('Product not found');
+    }
+
+    // Count the view (fire-and-forget: never block the page on it)
+    this.prisma.product
+      .update({ where: { id: product.id }, data: { viewCount: { increment: 1 } } })
+      .catch(() => undefined);
+
+    return serializeProduct(product);
   }
 
   async findOne(id: string) {
     const product = await this.prisma.product.findUnique({
       where: { id },
-      include: {
-        seller: {
-          select: {
-            id: true,
-            name: true,
-            avatarUrl: true,
-            sellerProfile: true,
-          },
-        },
+      select: {
+        ...PRODUCT_CARD_SELECT,
+        description: true,
         reviews: {
           include: {
             user: { select: { id: true, name: true, avatarUrl: true } },
@@ -198,70 +442,180 @@ export class ProductsService {
       },
     });
     if (!product) throw new NotFoundException('Product not found');
-
-    // Increment view count
-    await this.prisma.product.update({
-      where: { id },
-      data: { viewCount: { increment: 1 } },
-    });
-
-    return product;
+    return serializeProduct(product);
   }
 
-  async create(sellerId: string, dto: CreateProductDto) {
-    // Generate slug from name
-    const slug =
-      dto.name
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/(^-|-$)/g, '') +
-      '-' +
-      Date.now();
+  async getRelated(productId: string, categoryId: string | null, limit = 4) {
+    const products = await this.prisma.product.findMany({
+      where: {
+        status: 'PUBLISHED',
+        id: { not: productId },
+        ...(categoryId ? { categoryId } : {}),
+      },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      select: PRODUCT_CARD_SELECT,
+    });
+    return products.map(serializeProduct);
+  }
+
+  async create(user: any, dto: CreateProductDto) {
+    if (RESERVED_ROUTE_PARAMS.has(dto.categorySlug)) {
+      throw new BadRequestException('Invalid category');
+    }
+
+    const category = await this.prisma.category.findUnique({
+      where: { slug: dto.categorySlug.toLowerCase() },
+    });
+    if (!category) throw new BadRequestException('Unknown category');
+
+    // Sellers must have completed onboarding
+    const profile = await this.prisma.sellerProfile.findUnique({
+      where: { userId: user.id },
+    });
+    if (!profile && user.role !== 'ADMIN') {
+      throw new ForbiddenException('Create your seller profile first');
+    }
+
+    const images = (dto.images ?? []).filter(Boolean);
+    const wantsPublish = dto.publish ?? false;
+
+    if (wantsPublish) {
+      const errors = this.validateForPublish({
+        name: dto.name,
+        description: dto.description,
+        price: dto.price,
+        categoryId: category.id,
+        productType: dto.productType,
+        images,
+      });
+      if (errors.length) throw new BadRequestException({ message: errors, statusCode: 400 });
+    }
+
+    const slug = await this.createUniqueSlug(dto.name);
 
     return this.prisma.product.create({
       data: {
-        ...dto,
+        name: dto.name,
         slug,
-        sellerId,
-        tags: dto.tags ?? [],
-        images: dto.images ?? [],
+        description: dto.description,
+        price: dto.price,
+        originalPrice: dto.originalPrice ?? null,
+        productType: dto.productType,
+        status: wantsPublish ? 'PUBLISHED' : 'DRAFT',
+        tags: (dto.tags ?? []).map((t) => t.toLowerCase().trim()).filter(Boolean),
+        images,
+        inStock: dto.inStock ?? true,
+        categoryId: category.id,
+        sellerId: user.id,
       },
+      select: { id: true, slug: true, status: true, name: true },
     });
   }
 
-  async update(id: string, sellerId: string, dto: UpdateProductDto) {
+  /** Load a product the requester is allowed to mutate. */
+  private async getOwnedProduct(id: string, user: any) {
     const product = await this.prisma.product.findUnique({ where: { id } });
     if (!product) throw new NotFoundException('Product not found');
-    if (product.sellerId !== sellerId)
-      throw new ForbiddenException('Not your product');
-
-    return this.prisma.product.update({ where: { id }, data: dto });
+    if (product.sellerId !== user.id && user.role !== 'ADMIN') {
+      // Ownership enforced here — the server decides, never the client.
+      throw new ForbiddenException('You do not own this product');
+    }
+    return product;
   }
 
-  async remove(id: string, sellerId: string) {
-    const product = await this.prisma.product.findUnique({ where: { id } });
-    if (!product) throw new NotFoundException('Product not found');
-    if (product.sellerId !== sellerId)
-      throw new ForbiddenException('Not your product');
+  async update(id: string, user: any, dto: UpdateProductDto) {
+    const product = await this.getOwnedProduct(id, user);
 
+    const data: any = {};
+    if (dto.name !== undefined) data.name = dto.name; // slug intentionally NOT regenerated
+    if (dto.description !== undefined) data.description = dto.description;
+    if (dto.price !== undefined) data.price = dto.price;
+    if (dto.originalPrice !== undefined) data.originalPrice = dto.originalPrice;
+    if (dto.productType !== undefined) data.productType = dto.productType;
+    if (dto.tags !== undefined) {
+      data.tags = dto.tags.map((t) => t.toLowerCase().trim()).filter(Boolean);
+    }
+    if (dto.images !== undefined) data.images = dto.images.filter(Boolean);
+    if (dto.inStock !== undefined) data.inStock = dto.inStock;
+
+    if (dto.categorySlug !== undefined) {
+      const category = await this.prisma.category.findUnique({
+        where: { slug: dto.categorySlug.toLowerCase() },
+      });
+      if (!category) throw new BadRequestException('Unknown category');
+      data.categoryId = category.id;
+    }
+
+    // If the product is published, edits may not break publish rules
+    const next = {
+      name: data.name ?? product.name,
+      description: data.description ?? product.description,
+      price: data.price ?? product.price,
+      categoryId: data.categoryId ?? product.categoryId,
+      productType: data.productType ?? product.productType,
+      images: data.images ?? product.images,
+    };
+    if (product.status === 'PUBLISHED') {
+      const errors = this.validateForPublish(next);
+      if (errors.length) throw new BadRequestException({ message: errors, statusCode: 400 });
+    }
+
+    return this.prisma.product.update({
+      where: { id },
+      data,
+      select: { id: true, slug: true, status: true, name: true },
+    });
+  }
+
+  async publish(id: string, user: any) {
+    const product = await this.getOwnedProduct(id, user);
+    const errors = this.validateForPublish(product);
+    if (errors.length) throw new BadRequestException({ message: errors, statusCode: 400 });
+
+    return this.prisma.product.update({
+      where: { id },
+      data: { status: 'PUBLISHED' },
+      select: { id: true, slug: true, status: true },
+    });
+  }
+
+  async unpublish(id: string, user: any) {
+    await this.getOwnedProduct(id, user);
+    return this.prisma.product.update({
+      where: { id },
+      data: { status: 'UNPUBLISHED' },
+      select: { id: true, slug: true, status: true },
+    });
+  }
+
+  async remove(id: string, user: any) {
+    await this.getOwnedProduct(id, user);
     await this.prisma.product.delete({ where: { id } });
     return { message: 'Product deleted' };
   }
 
+  // ── Seller endpoints ─────────────────────────────────────
+
   async getSellerProducts(sellerId: string) {
-    return this.prisma.product.findMany({
+    const products = await this.prisma.product.findMany({
       where: { sellerId },
       orderBy: { createdAt: 'desc' },
+      select: PRODUCT_CARD_SELECT,
     });
-  }
+    const serialized = products.map(serializeProduct);
 
-  async getFeatured() {
-    return this.prisma.product.findMany({
-      where: { isPublished: true },
-      orderBy: { buyCount: 'desc' },
-      take: 8,
-      include: { seller: { select: { name: true } } },
-    });
+    const counts = {
+      total: products.length,
+      published: products.filter((p) => p.status === 'PUBLISHED').length,
+      draft: products.filter((p) => p.status === 'DRAFT').length,
+      unpublished: products.filter((p) => p.status === 'UNPUBLISHED').length,
+      digital: products.filter((p) => p.productType === 'DIGITAL').length,
+      physical: products.filter((p) => p.productType === 'PHYSICAL').length,
+      views: products.reduce((sum, p) => sum + p.viewCount, 0),
+    };
+
+    return { products: serialized, counts };
   }
 }
 
@@ -271,7 +625,7 @@ export class ProductsService {
 export class ProductsController {
   constructor(private products: ProductsService) {}
 
-  // GET /api/products — list all with filters
+  // GET /api/products — public marketplace listing w/ filters
   @Get()
   findAll(@Query() query: ProductQueryDto) {
     return this.products.findAll(query);
@@ -283,42 +637,71 @@ export class ProductsController {
     return this.products.getFeatured();
   }
 
-  // GET /api/products/:id
+  // GET /api/products/new — New Arrivals
+  @Get('new')
+  getNew() {
+    return this.products.getNew();
+  }
+
+  // GET /api/products/discovery — homepage multi-seller discovery grid
+  @Get('discovery')
+  getDiscovery() {
+    return this.products.getDiscovery(20);
+  }
+
+  // GET /api/products/slug/:slug — public product page (canonical URL)
+  @Get('slug/:slug')
+  findBySlug(@Param('slug') slug: string) {
+    return this.products.findBySlug(slug);
+  }
+
+  // GET /api/products/seller/me — my listings (any status)
+  @Get('seller/me')
+  @UseGuards(JwtAuthGuard)
+  getMyProducts(@CurrentUser() user: any) {
+    return this.products.getSellerProducts(user.id);
+  }
+
+  // POST /api/products — create (seller or admin)
+  @Post()
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('SELLER', 'ADMIN')
+  create(@CurrentUser() user: any, @Body() dto: CreateProductDto) {
+    return this.products.create(user, dto);
+  }
+
+  // GET /api/products/:id — single product (used for previews/edit)
   @Get(':id')
   findOne(@Param('id') id: string) {
     return this.products.findOne(id);
   }
 
-  // POST /api/products — create (seller only)
-  @Post()
-  @UseGuards(JwtAuthGuard)
-  create(@CurrentUser() user: any, @Body() dto: CreateProductDto) {
-    return this.products.create(user.id, dto);
-  }
-
-  // PATCH /api/products/:id — update (seller only)
+  // PATCH /api/products/:id — update (owner only)
   @Patch(':id')
   @UseGuards(JwtAuthGuard)
-  update(
-    @Param('id') id: string,
-    @CurrentUser() user: any,
-    @Body() dto: UpdateProductDto,
-  ) {
-    return this.products.update(id, user.id, dto);
+  update(@Param('id') id: string, @CurrentUser() user: any, @Body() dto: UpdateProductDto) {
+    return this.products.update(id, user, dto);
   }
 
-  // DELETE /api/products/:id — delete (seller only)
+  // POST /api/products/:id/publish — owner only, validated
+  @Post(':id/publish')
+  @UseGuards(JwtAuthGuard)
+  publish(@Param('id') id: string, @CurrentUser() user: any) {
+    return this.products.publish(id, user);
+  }
+
+  // POST /api/products/:id/unpublish — owner only
+  @Post(':id/unpublish')
+  @UseGuards(JwtAuthGuard)
+  unpublish(@Param('id') id: string, @CurrentUser() user: any) {
+    return this.products.unpublish(id, user);
+  }
+
+  // DELETE /api/products/:id — owner only
   @Delete(':id')
   @UseGuards(JwtAuthGuard)
   remove(@Param('id') id: string, @CurrentUser() user: any) {
-    return this.products.remove(id, user.id);
-  }
-
-  // GET /api/products/seller/me — my listings
-  @Get('seller/me')
-  @UseGuards(JwtAuthGuard)
-  getMyProducts(@CurrentUser() user: any) {
-    return this.products.getSellerProducts(user.id);
+    return this.products.remove(id, user);
   }
 }
 

@@ -20,11 +20,23 @@ import { ConfigService } from '@nestjs/config';
 import { v2 as cloudinary, UploadApiResponse } from 'cloudinary';
 import { FileFilterCallback, memoryStorage } from 'multer';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { mkdirSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { randomUUID } from 'crypto';
+import { Logger } from '@nestjs/common';
 
 // ── Service ───────────────────────────────────────────────
 
 @Injectable()
 export class UploadsService {
+  private readonly logger = new Logger(UploadsService.name);
+  /** Flips off permanently after the first Cloudinary failure → local disk. */
+  private cloudinaryEnabled = true;
+  /** Local fallback dir — inside the FRONTEND's public folder so uploaded
+   *  images are served by Next.js exactly like the seed images
+   *  (/images/uploads/<file>). Works because both apps run from this repo. */
+  private readonly localDir = join(process.cwd(), '..', 'kova', 'public', 'images', 'uploads');
+
   constructor(private config: ConfigService) {
     // Configure Cloudinary
     cloudinary.config({
@@ -32,11 +44,32 @@ export class UploadsService {
       api_key: this.config.get('CLOUDINARY_API_KEY'),
       api_secret: this.config.get('CLOUDINARY_API_SECRET'),
     });
+    mkdirSync(this.localDir, { recursive: true });
   }
 
+  /** Cloudinary when its keys are valid; transparent local-disk fallback
+   *  otherwise (e.g. invalid/expired demo credentials). URLs stay relative
+   *  so they render in the frontend without an absolute origin. */
   async uploadImage(
     file: Express.Multer.File,
     folder: string = 'kova/products',
+  ): Promise<string> {
+    if (this.cloudinaryEnabled) {
+      try {
+        return await this.cloudinaryUpload(file, folder);
+      } catch (err) {
+        this.cloudinaryEnabled = false;
+        this.logger.warn(
+          `Cloudinary upload failed (${(err as Error).message ?? err}) — using local disk fallback. Fix CLOUDINARY_* credentials in .env to restore cloud uploads.`,
+        );
+      }
+    }
+    return this.localUpload(file);
+  }
+
+  private cloudinaryUpload(
+    file: Express.Multer.File,
+    folder: string,
   ): Promise<string> {
     return new Promise((resolve, reject) => {
       cloudinary.uploader
@@ -58,6 +91,13 @@ export class UploadsService {
     });
   }
 
+  private localUpload(file: Express.Multer.File): string {
+    const ext = (file.mimetype?.split('/')[1] ?? 'jpg').replace('jpeg', 'jpg').replace(/[^a-z0-9]/gi, '') || 'jpg';
+    const name = `${Date.now()}-${randomUUID().slice(0, 8)}.${ext}`;
+    writeFileSync(join(this.localDir, name), file.buffer);
+    return `/images/uploads/${name}`;
+  }
+
   async uploadMultiple(
     files: Express.Multer.File[],
     folder: string = 'kova/products',
@@ -66,24 +106,7 @@ export class UploadsService {
   }
 
   async uploadAvatar(file: Express.Multer.File): Promise<string> {
-    return new Promise((resolve, reject) => {
-      cloudinary.uploader
-        .upload_stream(
-          {
-            folder: 'kova/avatars',
-            resource_type: 'image',
-            transformation: [
-              { width: 400, height: 400, crop: 'fill', gravity: 'face' },
-              { quality: 'auto', fetch_format: 'auto' },
-            ],
-          },
-          (error, result: UploadApiResponse | undefined) => {
-            if (error) reject(error);
-            else resolve(result!.secure_url);
-          },
-        )
-        .end(file.buffer);
-    });
+    return this.uploadImage(file, 'kova/avatars');
   }
 }
 

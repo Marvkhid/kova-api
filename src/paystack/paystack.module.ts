@@ -65,7 +65,7 @@ export class PaystackService {
       },
       body: JSON.stringify({
         email: dto.email,
-        amount: Math.round(order.total * 100), // convert to kobo
+        amount: Math.round(Number(order.total) * 100), // convert to kobo (Decimal-safe)
         reference: `kova-${order.id}-${Date.now()}`,
         metadata: { orderId: order.id, userId },
         callback_url: `${this.config.get('FRONTEND_URL')}/orders`,

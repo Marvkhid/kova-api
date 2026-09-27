@@ -34,6 +34,17 @@ export class UpdateCartItemDto {
 
 // ── Service ───────────────────────────────────────────────
 
+/** Prisma Decimal → JSON-safe number (Naira, 2dp max). */
+export function money(value: unknown): number {
+  if (value === null || value === undefined) return 0;
+  return Number(value);
+}
+
+/** Convert a product's Decimal money fields to plain numbers. */
+function serializeProduct<T extends { price: unknown; originalPrice?: unknown }>(p: T): T {
+  return { ...p, price: money(p.price), originalPrice: p.originalPrice ? money(p.originalPrice) : null };
+}
+
 @Injectable()
 export class CartService {
   constructor(private prisma: PrismaService) {}
@@ -45,14 +56,18 @@ export class CartService {
       orderBy: { createdAt: 'asc' },
     });
 
-    const subtotal = items.reduce(
-      (sum, item) => sum + item.product.price * item.quantity,
+    const serialized = items.map((item) => ({ ...item, product: serializeProduct(item.product) }));
+
+    // Money math in kobo-equivalent cents to avoid float drift
+    const subtotalCents = serialized.reduce(
+      (sum, item) => sum + Math.round(money(item.product.price) * 100) * item.quantity,
       0,
     );
-    const shipping = subtotal >= 50 ? 0 : subtotal > 0 ? 4.99 : 0;
+    const subtotal = subtotalCents / 100;
+    const shipping = subtotal >= 50000 ? 0 : subtotal > 0 ? 2500 : 0; // ₦2,500 flat, free over ₦50,000
     const total = subtotal + shipping;
 
-    return { items, subtotal, shipping, total, count: items.length };
+    return { items: serialized, subtotal, shipping, total, count: items.length };
   }
 
   async addItem(sessionId: string, dto: AddToCartDto) {

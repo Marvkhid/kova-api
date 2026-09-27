@@ -1,10 +1,10 @@
 // ============================================================
-// KOVA API — Users Service + Module
-// Handles user creation, profile, sync from Clerk.
+// KOVA API — Users Service
+// User creation/sync from Clerk, profile updates, role handling.
 // ============================================================
 
-import { Injectable, NotFoundException, Module } from '@nestjs/common';
-import { IsString, IsEmail, IsOptional } from 'class-validator';
+import { Injectable, NotFoundException } from '@nestjs/common';
+import { IsEmail, IsOptional, IsString } from 'class-validator';
 import { PrismaService } from '../prisma/prisma.module';
 
 // ── DTOs ──────────────────────────────────────────────────
@@ -13,6 +13,7 @@ export class FindOrCreateUserDto {
   clerkId: string;
   email: string;
   name?: string;
+  avatarUrl?: string;
 }
 
 export class UpdateProfileDto {
@@ -21,25 +22,31 @@ export class UpdateProfileDto {
   @IsOptional() @IsString() avatarUrl?: string;
 }
 
+export class UpdateEmailDto {
+  @IsEmail() email: string;
+}
+
 // ── Service ───────────────────────────────────────────────
 
 @Injectable()
 export class UsersService {
   constructor(private prisma: PrismaService) {}
 
-  // Find existing user or create from Clerk data
+  // Find existing user or create from Clerk data (idempotent)
   async findOrCreate(dto: FindOrCreateUserDto) {
     const existing = await this.prisma.user.findUnique({
       where: { clerkId: dto.clerkId },
     });
-
     if (existing) return existing;
 
-    return this.prisma.user.create({
-      data: {
+    return this.prisma.user.upsert({
+      where: { email: dto.email },
+      update: { clerkId: dto.clerkId },
+      create: {
         clerkId: dto.clerkId,
         email: dto.email,
         name: dto.name ?? null,
+        avatarUrl: dto.avatarUrl ?? null,
       },
     });
   }
@@ -62,6 +69,14 @@ export class UsersService {
     return user;
   }
 
+  /** Non-throwing variant used by the auth flow. */
+  async findByClerkIdOrNull(clerkId: string) {
+    return this.prisma.user.findUnique({
+      where: { clerkId },
+      include: { sellerProfile: true },
+    });
+  }
+
   async updateProfile(id: string, dto: UpdateProfileDto) {
     return this.prisma.user.update({
       where: { id },
@@ -81,43 +96,26 @@ export class UsersService {
       orderBy: { createdAt: 'desc' },
     });
   }
-}
 
-// ── Controller ────────────────────────────────────────────
+  // ── Admin helpers (used by the admin module) ─────────────
 
-import { Controller, Get, Patch, Body, UseGuards } from '@nestjs/common';
-import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard'
-import { CurrentUser } from '../auth/current-user.decorator';
-
-@Controller('users')
-@UseGuards(JwtAuthGuard)
-export class UsersController {
-  constructor(private users: UsersService) {}
-
-  // GET /api/users/me — get current user profile
-  @Get('me')
-  async getMe(@CurrentUser() user: any) {
-    return this.users.findById(user.id);
+  async listUsers(limit = 50, offset = 0) {
+    const [users, total] = await Promise.all([
+      this.prisma.user.findMany({
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        skip: offset,
+        include: { sellerProfile: { select: { storeName: true, storeSlug: true } } },
+      }),
+      this.prisma.user.count(),
+    ]);
+    return { users, total };
   }
 
-  // PATCH /api/users/me — update profile
-  @Patch('me')
-  async updateMe(@CurrentUser() user: any, @Body() dto: UpdateProfileDto) {
-    return this.users.updateProfile(user.id, dto);
-  }
-
-  // GET /api/users/me/orders — get order history
-  @Get('me/orders')
-  async getMyOrders(@CurrentUser() user: any) {
-    return this.users.getOrders(user.id);
+  async countByRole() {
+    const grouped = await this.prisma.user.groupBy({ by: ['role'], _count: true });
+    const result = { BUYER: 0, SELLER: 0, ADMIN: 0 };
+    for (const g of grouped) result[g.role] = g._count;
+    return result;
   }
 }
-
-// ── Module ────────────────────────────────────────────────
-
-@Module({
-  providers: [UsersService],
-  controllers: [UsersController],
-  exports: [UsersService],
-})
-export class UsersModule {}
