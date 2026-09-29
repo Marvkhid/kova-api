@@ -1,0 +1,39 @@
+# ============================================================
+# KOVA API — Render Blueprint
+# Deploy: Render Dashboard → New → Blueprint → pick this repo.
+# Render reads this file and creates the service. Fill in the
+# `sync: false` secrets in the dashboard when prompted.
+# ============================================================
+services:
+  - type: web
+    name: kova-api
+    runtime: node
+    plan: free # spins down when idle; first request takes ~50s
+    rootDir: kova-api # monorepo — the NestJS app lives here
+    buildCommand: npm install && npm run build
+    startCommand: npx prisma migrate deploy && node dist/src/main.js
+    healthCheckPath: /api/categories
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Public frontend URL — used for CORS + Paystack callback
+      - key: FRONTEND_URL
+        value: https://kova-shopp.vercel.app
+      # Same Postgres instance as local dev (Prisma pooled URL
+      # from kova-api/.env). Products/categories/stores then
+      # match localhost exactly.
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      # resend.dev sender only delivers to the Resend account
+      # owner's inbox — verify a domain to email real users.
+      - key: FROM_EMAIL
+        value: onboarding@resend.dev
+      # Optional: extra CORS origins, comma-separated
+      # - key: EXTRA_ORIGINS
+      #   value: https://staging.kova.example

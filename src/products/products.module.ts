@@ -58,6 +58,23 @@ export class CreateProductDto {
   @MaxLength(120)
   name: string;
 
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  condition?: string; // e.g. "Brand new" / "Refurbished" / "Used — excellent"
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(1_000_000)
+  @Type(() => Number)
+  quantity?: number; // available units (physical stock)
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  digitalInfo?: string; // file type / access info for digital products
+
   @IsString()
   @MinLength(20, { message: 'Description must be at least 20 characters' })
   @MaxLength(5000)
@@ -107,6 +124,10 @@ export class UpdateProductDto {
   @MinLength(3)
   @MaxLength(120)
   name?: string;
+
+  @IsOptional() @IsString() @MaxLength(60) condition?: string;
+  @IsOptional() @IsNumber() @Min(0) @Max(1_000_000) @Type(() => Number) quantity?: number;
+  @IsOptional() @IsString() @MaxLength(500) digitalInfo?: string;
 
   @IsOptional()
   @IsString()
@@ -200,7 +221,7 @@ const PRODUCT_CARD_SELECT = {
       id: true,
       name: true,
       avatarUrl: true,
-      sellerProfile: { select: { storeName: true, storeSlug: true } },
+      sellerProfile: { select: { storeName: true, storeSlug: true, isVerified: true } },
     },
   },
 };
@@ -480,6 +501,27 @@ export class ProductsService {
     const images = (dto.images ?? []).filter(Boolean);
     const wantsPublish = dto.publish ?? false;
 
+    // Governance: seller status decides whether publish is even possible.
+    // Enforced HERE on the server — never by the UI alone.
+    let publishStatus: 'PUBLISHED' | 'PENDING_REVIEW' = 'PUBLISHED';
+    if (wantsPublish && user.role !== 'ADMIN') {
+      if (profile.sellerStatus === 'PENDING') {
+        throw new ForbiddenException(
+          'Your seller application is still under review — products can be saved as drafts, but not published yet',
+        );
+      }
+      if (profile.sellerStatus === 'REJECTED') {
+        throw new ForbiddenException(
+          'Your seller application was not approved — you cannot publish products',
+        );
+      }
+      if (profile.sellerStatus === 'SUSPENDED' || profile.sellerStatus === 'BLOCKED') {
+        throw new ForbiddenException(
+          `Your seller account is ${profile.sellerStatus.toLowerCase()} — contact support`,
+        );
+      }
+    }
+
     if (wantsPublish) {
       const errors = this.validateForPublish({
         name: dto.name,
@@ -502,7 +544,10 @@ export class ProductsService {
         price: dto.price,
         originalPrice: dto.originalPrice ?? null,
         productType: dto.productType,
-        status: wantsPublish ? 'PUBLISHED' : 'DRAFT',
+        condition: dto.condition ?? null,
+        quantity: dto.quantity ?? null,
+        digitalInfo: dto.digitalInfo ?? null,
+        status: wantsPublish ? publishStatus : 'DRAFT',
         tags: (dto.tags ?? []).map((t) => t.toLowerCase().trim()).filter(Boolean),
         images,
         inStock: dto.inStock ?? true,
@@ -533,6 +578,9 @@ export class ProductsService {
     if (dto.price !== undefined) data.price = dto.price;
     if (dto.originalPrice !== undefined) data.originalPrice = dto.originalPrice;
     if (dto.productType !== undefined) data.productType = dto.productType;
+    if (dto.condition !== undefined) data.condition = dto.condition;
+    if (dto.quantity !== undefined) data.quantity = dto.quantity;
+    if (dto.digitalInfo !== undefined) data.digitalInfo = dto.digitalInfo;
     if (dto.tags !== undefined) {
       data.tags = dto.tags.map((t) => t.toLowerCase().trim()).filter(Boolean);
     }
@@ -573,9 +621,40 @@ export class ProductsService {
     const errors = this.validateForPublish(product);
     if (errors.length) throw new BadRequestException({ message: errors, statusCode: 400 });
 
+    // Governance: seller status gates publishing server-side.
+    const profile = user.role === 'ADMIN'
+      ? null
+      : await this.prisma.sellerProfile.findUnique({
+          where: { userId: user.id },
+        });
+    if (user.role !== 'ADMIN') {
+      if (!profile || profile.sellerStatus === 'PENDING') {
+        throw new ForbiddenException(
+          'Your seller application is under review — publishing unlocks once approved',
+        );
+      }
+      if (profile.sellerStatus === 'REJECTED') {
+        throw new ForbiddenException(
+          'Your seller application was not approved — you cannot publish products',
+        );
+      }
+      if (profile.sellerStatus === 'SUSPENDED' || profile.sellerStatus === 'BLOCKED') {
+        throw new ForbiddenException(
+          `Your seller account is ${profile.sellerStatus.toLowerCase()} — contact support`,
+        );
+      }
+    }
+
+    // APPROVED sellers publish straight live; anyone else (should never
+    // reach here) would go through review. Admins always publish live.
+    const nextStatus: 'PUBLISHED' | 'PENDING_REVIEW' =
+      user.role === 'ADMIN' || profile?.sellerStatus === 'APPROVED'
+        ? 'PUBLISHED'
+        : 'PENDING_REVIEW';
+
     return this.prisma.product.update({
       where: { id },
-      data: { status: 'PUBLISHED' },
+      data: { status: nextStatus, moderationReason: null, moderatedAt: null },
       select: { id: true, slug: true, status: true },
     });
   }
@@ -609,6 +688,8 @@ export class ProductsService {
       total: products.length,
       published: products.filter((p) => p.status === 'PUBLISHED').length,
       draft: products.filter((p) => p.status === 'DRAFT').length,
+      pendingReview: products.filter((p) => p.status === 'PENDING_REVIEW').length,
+      rejected: products.filter((p) => p.status === 'REJECTED').length,
       unpublished: products.filter((p) => p.status === 'UNPUBLISHED').length,
       digital: products.filter((p) => p.productType === 'DIGITAL').length,
       physical: products.filter((p) => p.productType === 'PHYSICAL').length,

@@ -12,12 +12,18 @@ async function bootstrap() {
   // Global prefix — all routes start with /api
   app.setGlobalPrefix('api');
 
-  // CORS — allow requests from Next.js frontend
+  // CORS - allow requests from the KOVA frontends (localhost dev +
+  // Vercel production). Extra origins via EXTRA_ORIGINS (comma-separated).
+  const corsOrigins = [
+    process.env.FRONTEND_URL || 'http://localhost:3000',
+    'http://localhost:3000',
+    'https://kova-shopp.vercel.app',
+    ...(process.env.EXTRA_ORIGINS ? process.env.EXTRA_ORIGINS.split(',') : []),
+  ].filter(Boolean);
+
   app.enableCors({
-    origin: process.env.FRONTEND_URL || 'http://kova-shopp.vercel.app',
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  });
+    origin: corsOrigins,
+    credentials: true,});
 
   // Global validation pipe — validates all DTOs
   app.useGlobalPipes(

@@ -21,6 +21,8 @@ import { JwtService } from '@nestjs/jwt';
 import { IsEmail, IsOptional, IsString, MinLength, MaxLength, Matches } from 'class-validator';
 import * as bcrypt from 'bcryptjs';
 import { PrismaService } from '../prisma/prisma.module';
+import { AuthTokensService } from './auth-tokens.service';
+import { MailerService } from './mailer.service';
 
 // ── DTOs ──────────────────────────────────────────────────
 
@@ -74,6 +76,8 @@ export class LocalAuthService {
   constructor(
     private prisma: PrismaService,
     private jwt: JwtService,
+    private tokens: AuthTokensService,
+    private mailer: MailerService,
   ) {}
 
   /** Deterministic, URL-safe, unique store slug with numeric suffix fallback. */
@@ -164,6 +168,47 @@ export class LocalAuthService {
     }
 
     return this.buildAuthResponse(user);
+  }
+
+  // ── Email verification ────────────────────────────────────
+
+  async verifyEmail(token: string) {
+    const { userId } = await this.tokens.consume(token, 'EMAIL_VERIFY');
+    const user = await this.prisma.user.update({
+      where: { id: userId },
+      data: { emailVerifiedAt: new Date() },
+    });
+    return { verified: true, email: user.email };
+  }
+
+  async resendVerification(userId: string) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new UnauthorizedException('Account not found');
+    if (user.emailVerifiedAt) {
+      return { sent: false, message: 'Email is already verified' };
+    }
+    const token = await this.tokens.issue(user.id, 'EMAIL_VERIFY');
+    const delivered = await this.mailer.sendEmailVerification(user.email, token);
+    return { sent: true, delivered };
+  }
+
+  // ── Password reset ────────────────────────────────────────
+
+  /** Always returns { sent: true } — never reveals which emails exist. */
+  async forgotPassword(email: string) {
+    const normalized = email.trim().toLowerCase();
+    const user = await this.prisma.user.findUnique({ where: { email: normalized } });
+    if (!user || !user.passwordHash) return { sent: true };
+    const token = await this.tokens.issue(user.id, 'PASSWORD_RESET');
+    const delivered = await this.mailer.sendPasswordReset(user.email, token);
+    return { sent: true, delivered };
+  }
+
+  async resetPassword(token: string, password: string) {
+    const { userId } = await this.tokens.consume(token, 'PASSWORD_RESET');
+    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    await this.prisma.user.update({ where: { id: userId }, data: { passwordHash } });
+    return { reset: true };
   }
 
   /** Called by the guard for `local:` users on every request — no DB hit. */

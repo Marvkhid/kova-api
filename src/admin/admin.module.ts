@@ -12,22 +12,26 @@
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   Delete,
   Get,
   Injectable,
+  Logger,
   Module,
   NotFoundException,
   Param,
   Patch,
+  Post,
   Query,
   UseGuards,
 } from '@nestjs/common';
-import { IsEnum, IsNumber, IsOptional, IsString, Max, Min } from 'class-validator';
+import { IsEnum, IsNumber, IsOptional, IsString, Max, Min, MaxLength } from 'class-validator';
 import { Type } from 'class-transformer';
 import { PrismaService } from '../prisma/prisma.module';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard, Roles } from '../auth/guards/roles.guard';
+import { MailerService } from '../auth/mailer.service';
 
 // ── DTOs ──────────────────────────────────────────────────
 
@@ -39,11 +43,25 @@ class UpdateRoleDto {
 class UpdateProductStatusDto {
   @IsEnum({
     DRAFT: 'DRAFT',
+    PENDING_REVIEW: 'PENDING_REVIEW',
     PUBLISHED: 'PUBLISHED',
+    REJECTED: 'REJECTED',
     UNPUBLISHED: 'UNPUBLISHED',
     REMOVED: 'REMOVED',
   })
-  status: 'DRAFT' | 'PUBLISHED' | 'UNPUBLISHED' | 'REMOVED';
+  status: 'DRAFT' | 'PENDING_REVIEW' | 'PUBLISHED' | 'REJECTED' | 'UNPUBLISHED' | 'REMOVED';
+  @IsOptional() @IsString() @MaxLength(500) reason?: string;
+}
+
+/** Seller moderation decision. reason goes to the seller; note stays internal. */
+class SellerDecisionDto {
+  @IsOptional() @IsString() @MaxLength(500) reason?: string;
+  @IsOptional() @IsString() @MaxLength(500) note?: string;
+}
+
+class RejectSellerDto {
+  @IsString() @MaxLength(500) reason: string;
+  @IsOptional() @IsString() @MaxLength(500) note?: string;
 }
 
 class AdminQueryDto {
@@ -57,7 +75,12 @@ class AdminQueryDto {
 
 @Injectable()
 export class AdminService {
-  constructor(private prisma: PrismaService) {}
+  private readonly logger = new Logger(AdminService.name);
+
+  constructor(
+    private prisma: PrismaService,
+    private mailer: MailerService,
+  ) {}
 
   /** Real, database-computed metrics — no estimates. */
   async getOverview() {
@@ -79,6 +102,11 @@ export class AdminService {
       totalOrders,
       paidOrders,
       usersByRole,
+      pendingSellers,
+      approvedSellers,
+      suspendedSellers,
+      pendingReviewProducts,
+      rejectedProducts,
     ] = await Promise.all([
       this.prisma.user.count(),
       this.prisma.user.count({ where: { role: 'SELLER' } }),
@@ -93,6 +121,11 @@ export class AdminService {
       this.prisma.order.count(),
       this.prisma.order.count({ where: { paymentStatus: 'PAID' } }),
       this.prisma.user.groupBy({ by: ['role'], _count: true }),
+      this.prisma.sellerProfile.count({ where: { sellerStatus: 'PENDING' } }),
+      this.prisma.sellerProfile.count({ where: { sellerStatus: 'APPROVED' } }),
+      this.prisma.sellerProfile.count({ where: { sellerStatus: { in: ['SUSPENDED', 'BLOCKED'] } } }),
+      this.prisma.product.count({ where: { status: 'PENDING_REVIEW' } }),
+      this.prisma.product.count({ where: { status: 'REJECTED' } }),
     ]);
 
     const roleCounts: Record<string, number> = { BUYER: 0, SELLER: 0, ADMIN: 0 };
@@ -104,6 +137,14 @@ export class AdminService {
         buyers: roleCounts.BUYER,
         sellers: roleCounts.SELLER,
         admins: roleCounts.ADMIN,
+      },
+      moderation: {
+        // Clickable cards on the admin dashboard → seller/product queues
+        pendingSellerApplications: pendingSellers,
+        approvedSellers,
+        suspendedSellers,
+        pendingProductReviews: pendingReviewProducts,
+        rejectedProducts,
       },
       products: {
         total: totalProducts,
@@ -232,6 +273,274 @@ export class AdminService {
     await this.prisma.product.delete({ where: { id } });
     return { message: 'Product deleted' };
   }
+
+  // ── Seller applications & governance ───────────────────
+
+  /** Seller applications queue (optionally filtered by status). */
+  async listSellerApplications(status?: string) {
+    const where = status
+      ? { sellerStatus: status.toUpperCase() as any }
+      : {};
+    const sellers = await this.prisma.sellerProfile.findMany({
+      where,
+      orderBy: [{ appliedAt: 'desc' }, { createdAt: 'desc' }],
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            avatarUrl: true,
+            createdAt: true,
+            _count: { select: { products: true } },
+          },
+        },
+      },
+    });
+    return {
+      applications: sellers.map((s) => ({
+        id: s.id,
+        userId: s.userId,
+        storeName: s.storeName,
+        storeSlug: s.storeSlug,
+        description: s.description,
+        location: s.location,
+        category: s.category,
+        logoUrl: s.logoUrl,
+        bannerUrl: s.bannerUrl,
+        sellerStatus: s.sellerStatus,
+        phone: s.phone,
+        email: s.user.email,
+        ownerName: s.user.name,
+        ownerAvatarUrl: s.user.avatarUrl,
+        registeredAt: s.user.createdAt,
+        appliedAt: s.appliedAt,
+        approvedAt: s.approvedAt,
+        rejectedAt: s.rejectedAt,
+        suspendedAt: s.suspendedAt,
+        rejectionReason: s.rejectionReason,
+        termsVersion: s.termsVersion,
+        termsAcceptedAt: s.termsAcceptedAt,
+        productCount: s.user._count.products,
+      })),
+    };
+  }
+
+  /** Full application detail for the admin review screen. done by me  */
+  async getSellerApplication(profileId: string) {
+    const profile = await this.prisma.sellerProfile.findUnique({
+      where: { id: profileId },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            avatarUrl: true,
+            bio: true,
+            phone: true,
+            createdAt: true,
+            _count: { select: { products: true, orders: true } },
+          },
+        },
+      },
+    });
+    if (!profile) throw new NotFoundException('Seller application not found');
+
+    const products = await this.prisma.product.findMany({
+      where: { sellerId: profile.userId },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        name: true,
+        slug: true,
+        description: true,
+        price: true,
+        productType: true,
+        status: true,
+        images: true,
+        condition: true,
+        quantity: true,
+        tags: true,
+        createdAt: true,
+        category: { select: { name: true, slug: true } },
+      },
+    });
+
+    return {
+      id: profile.id,
+      userId: profile.userId,
+      storeName: profile.storeName,
+      storeSlug: profile.storeSlug,
+      description: profile.description,
+      location: profile.location,
+      category: profile.category,
+      logoUrl: profile.logoUrl,
+      bannerUrl: profile.bannerUrl,
+      sellerStatus: profile.sellerStatus,
+      phone: profile.phone,
+      email: profile.user.email,
+      ownerName: profile.user.name,
+      ownerBio: profile.user.bio,
+      ownerAvatarUrl: profile.user.avatarUrl,
+      registeredAt: profile.user.createdAt,
+      appliedAt: profile.appliedAt,
+      approvedAt: profile.approvedAt,
+      rejectedAt: profile.rejectedAt,
+      suspendedAt: profile.suspendedAt,
+      rejectionReason: profile.rejectionReason,
+      adminNote: profile.adminNote,
+      termsVersion: profile.termsVersion,
+      termsAcceptedAt: profile.termsAcceptedAt,
+      productCount: profile.user._count.products,
+      orderCount: profile.user._count.orders,
+      products: products.map((p) => ({ ...p, price: Number(p.price) })),
+    };
+  }
+
+  /** Common guard for seller moderation actions. */
+  private async getSellerOrThrow(profileId: string) {
+    const profile = await this.prisma.sellerProfile.findUnique({
+      where: { id: profileId },
+      include: { user: { select: { id: true, email: true, name: true } } },
+    });
+    if (!profile) throw new NotFoundException('Seller application not found');
+    return profile;
+  }
+
+  async approveSeller(profileId: string) {
+    const profile = await this.getSellerOrThrow(profileId);
+    if (profile.sellerStatus === 'APPROVED') {
+      throw new ConflictException('Seller is already approved');
+    }
+    const updated = await this.prisma.sellerProfile.update({
+      where: { id: profileId },
+      data: {
+        sellerStatus: 'APPROVED',
+        isVerified: true,
+        approvedAt: new Date(),
+        rejectedAt: null,
+        rejectionReason: null,
+      },
+    });
+    // Notify (non-blocking; logged when Resend is not configured)
+    this.mailer
+      .sendSellerApproved(profile.user.email, profile.storeName)
+      .catch((e) => this.logger.warn(`Approval email failed: ${e?.message ?? e}`));
+    return updated;
+  }
+
+  async rejectSeller(profileId: string, dto: RejectSellerDto) {
+    const profile = await this.getSellerOrThrow(profileId);
+    if (profile.sellerStatus === 'APPROVED') {
+      throw new BadRequestException('Suspend or block an approved seller instead of rejecting');
+    }
+    const updated = await this.prisma.sellerProfile.update({
+      where: { id: profileId },
+      data: {
+        sellerStatus: 'REJECTED',
+        isVerified: false,
+        rejectedAt: new Date(),
+        rejectionReason: dto.reason,
+        adminNote: dto.note ?? null,
+      },
+    });
+    // The rejection reason goes to the seller; the admin note stays internal.
+    this.mailer
+      .sendSellerRejected(profile.user.email, profile.storeName, dto.reason)
+      .catch((e) => this.logger.warn(`Rejection email failed: ${e?.message ?? e}`));
+    return updated;
+  }
+
+  async setSellerRestricted(profileId: string, action: 'SUSPENDED' | 'BLOCKED', dto: SellerDecisionDto) {
+    const profile = await this.getSellerOrThrow(profileId);
+    if (profile.sellerStatus === 'BLOCKED' && action === 'SUSPENDED') {
+      throw new BadRequestException('Seller is already blocked');
+    }
+    const updated = await this.prisma.sellerProfile.update({
+      where: { id: profileId },
+      data: {
+        sellerStatus: action,
+        isVerified: false,
+        suspendedAt: new Date(),
+        ...(action === 'SUSPENDED' ? { rejectionReason: dto.reason ?? null } : {}),
+        ...(dto.note ? { adminNote: dto.note } : {}),
+      },
+    });
+
+    // Suspension must have real teeth: pull the store's live listings.
+    await this.prisma.product.updateMany({
+      where: { sellerId: profile.userId, status: 'PUBLISHED' },
+      data: { status: 'UNPUBLISHED' },
+    });
+
+    this.mailer
+      .sendSellerSuspended(profile.user.email, profile.storeName, dto.reason)
+      .catch((e) => this.logger.warn(`Suspension email failed: ${e?.message ?? e}`));
+    return updated;
+  }
+
+  /** Reinstate a suspended seller. */
+  async reinstateSeller(profileId: string) {
+    const profile = await this.getSellerOrThrow(profileId);
+    if (profile.sellerStatus !== 'SUSPENDED' && profile.sellerStatus !== 'BLOCKED') {
+      throw new BadRequestException('Only suspended or blocked sellers can be reinstated');
+    }
+    return this.prisma.sellerProfile.update({
+      where: { id: profileId },
+      data: {
+        sellerStatus: 'APPROVED',
+        isVerified: true,
+        approvedAt: new Date(),
+        suspendedAt: null,
+        rejectionReason: null,
+      },
+    });
+  }
+
+  /** Product moderation with an auditable reason. */
+  async moderateProduct(id: string, status: string, reason?: string) {
+    const product = await this.prisma.product.findUnique({ where: { id } });
+    if (!product) throw new NotFoundException('Product not found');
+    return this.prisma.product.update({
+      where: { id },
+      data: {
+        status: status as any,
+        moderationReason: reason ?? null,
+        moderatedAt: new Date(),
+      },
+      select: { id: true, slug: true, status: true, moderationReason: true },
+    });
+  }
+
+  /**
+   * Hard-delete a user and everything that belongs to them.
+   * Used by both admin deletion and self-service account deletion.
+   */
+  async deleteUserCompletely(userId: string) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new NotFoundException('User not found');
+    if (user.role === 'ADMIN') {
+      throw new BadRequestException('Admin accounts cannot be deleted through this endpoint');
+    }
+
+    // Products first — their OrderItems keep the product row alive and
+    // must be cleared before the product (and then the user) can go.
+    await this.prisma.orderItem.deleteMany({ where: { product: { sellerId: userId } } });
+    await this.prisma.product.deleteMany({ where: { sellerId: userId } });
+
+    // The user's own orders: items cascade with the order; events too.
+    await this.prisma.order.deleteMany({ where: { userId } });
+
+    // Everything else cascades via FK (reviews, seller profile, wishlist,
+    // auth tokens, seller reviews) — but cart items use sessionId, so
+    // there is nothing user-scoped to clean there.
+    await this.prisma.user.delete({ where: { id: userId } });
+
+    return {
+      message: `Account for ${user.email} deleted, including all their products and marketplace activity`,
+    };
+  }
 }
 
 // ── Controller ────────────────────────────────────────────
@@ -267,12 +576,62 @@ export class AdminController {
 
   @Patch('products/:id/status')
   updateProductStatus(@Param('id') id: string, @Body() dto: UpdateProductStatusDto) {
-    return this.admin.updateProductStatus(id, dto.status);
+    return this.admin.moderateProduct(id, dto.status, dto.reason);
   }
 
   @Delete('products/:id')
   deleteProduct(@Param('id') id: string) {
     return this.admin.deleteProduct(id);
+  }
+
+  // ── Seller applications & governance ────────────────────
+
+  /** GET /api/admin/sellers?status=PENDING — application queue. */
+  @Get('sellers')
+  listSellerApplications(@Query('status') status?: string) {
+    return this.admin.listSellerApplications(status);
+  }
+
+  /** GET /api/admin/sellers/:id — full review screen payload. */
+  @Get('sellers/:id')
+  getSellerApplication(@Param('id') id: string) {
+    return this.admin.getSellerApplication(id);
+  }
+
+  /** POST /api/admin/sellers/:id/approve */
+  @Post('sellers/:id/approve')
+  approveSeller(@Param('id') id: string) {
+    return this.admin.approveSeller(id);
+  }
+
+  /** POST /api/admin/sellers/:id/reject — reason required. */
+  @Post('sellers/:id/reject')
+  rejectSeller(@Param('id') id: string, @Body() dto: RejectSellerDto) {
+    return this.admin.rejectSeller(id, dto);
+  }
+
+  /** POST /api/admin/sellers/:id/suspend — pulls live listings. */
+  @Post('sellers/:id/suspend')
+  suspendSeller(@Param('id') id: string, @Body() dto: SellerDecisionDto) {
+    return this.admin.setSellerRestricted(id, 'SUSPENDED', dto);
+  }
+
+  /** POST /api/admin/sellers/:id/block — full seller lockout. */
+  @Post('sellers/:id/block')
+  blockSeller(@Param('id') id: string, @Body() dto: SellerDecisionDto) {
+    return this.admin.setSellerRestricted(id, 'BLOCKED', dto);
+  }
+
+  /** POST /api/admin/sellers/:id/reinstate — suspended/blocked → approved. */
+  @Post('sellers/:id/reinstate')
+  reinstateSeller(@Param('id') id: string) {
+    return this.admin.reinstateSeller(id);
+  }
+
+  /** DELETE /api/admin/users/:id — wipe an account, its store, its products. */
+  @Delete('users/:id')
+  deleteUser(@Param('id') id: string) {
+    return this.admin.deleteUserCompletely(id);
   }
 }
 

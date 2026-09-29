@@ -9,6 +9,8 @@ import { JwtModule } from '@nestjs/jwt';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { AuthService } from './auth.service';
 import { LocalAuthService } from './local-auth.service';
+import { AuthTokensService } from './auth-tokens.service';
+import { MailerService } from './mailer.service';
 import { LocalAuthController } from './local-auth.controller';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { RolesGuard } from './guards/roles.guard';
@@ -32,7 +34,7 @@ import { UsersModule } from '../users/users.module';
     }),
   ],
   controllers: [LocalAuthController],
-  providers: [AuthService, LocalAuthService, JwtAuthGuard, RolesGuard],
-  exports: [AuthService, LocalAuthService, JwtAuthGuard, RolesGuard],
+  providers: [AuthService, LocalAuthService, AuthTokensService, MailerService, JwtAuthGuard, RolesGuard],
+  exports: [AuthService, LocalAuthService, AuthTokensService, MailerService, JwtAuthGuard, RolesGuard],
 })
 export class AuthModule {}

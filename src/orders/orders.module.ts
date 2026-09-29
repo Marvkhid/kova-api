@@ -571,8 +571,10 @@ export class OrdersController {
     return this.orders.updateItemFulfillment(id, itemId, user, dto);
   }
 
-  // POST /api/orders/verify-payment — confirm payment (Paystack flow)
+  // POST /api/orders/verify-payment — confirm payment (Paystack flow).
+  // Guarded: this marks orders PAID, so it must never be callable anonymously.
   @Post('verify-payment')
+  @UseGuards(JwtAuthGuard)
   verifyPayment(@Body() dto: { orderId: string; reference: string }) {
     return this.orders.confirmPayment(dto.orderId, dto.reference);
   }

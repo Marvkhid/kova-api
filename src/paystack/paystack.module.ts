@@ -18,7 +18,7 @@ import {
   Req,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { IsNumber, IsString, Min } from 'class-validator';
+import { IsNumber, IsOptional, IsString, IsEmail, Min } from 'class-validator';
 import { Type } from 'class-transformer';
 import { createHmac } from 'crypto';
 import { PrismaService } from '../prisma/prisma.module';
@@ -31,8 +31,9 @@ import type { Request } from 'express';
 
 export class InitializePaymentDto {
   @IsString() orderId: string;
-  @IsString() email: string;
-  @IsNumber() @Min(1) @Type(() => Number) amount: number; // currently not trusted; DB total used
+  @IsEmail() email: string;
+  // Optional + untrusted: the charge amount always comes from the DB order total.
+  @IsOptional() @IsNumber() @Min(1) @Type(() => Number) amount?: number;
 }
 
 // ── Service ───────────────────────────────────────────────

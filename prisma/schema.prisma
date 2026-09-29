@@ -1,13 +1,13 @@
 // ============================================================
-// KOVA — Prisma Schema (Marketplace v3)
-// v3 additions:
-//   • Money as Decimal(12,2) — no float arithmetic for Naira
-//   • OrderEvent: append-only fulfillment timeline (source of truth)
-//   • OrderItem.fulfillmentStatus: per-item physical/digital lifecycle
-//   • SellerReview: separate seller reputation (1-5 + dimensions)
-//   • Review.verifiedPurchase: computed server-side from order data
-//   • Review title + admin moderation (ReviewStatus)
-// Run: npx prisma migrate dev --name marketplace_v3
+// KOVA — Prisma Schema (Marketplace v3 + Seller Governance v4)
+// v4 additions:
+//   • SellerStatus lifecycle: PENDING → APPROVED / REJECTED,
+//     plus SUSPENDED / BLOCKED (admin moderation states)
+//   • Seller application timestamps + rejection reason
+//   • Terms acceptance tracking (versioned)
+//   • Product moderation: PENDING_REVIEW / REJECTED statuses
+//     + admin moderationReason
+// Run: npx prisma migrate deploy
 // ============================================================
 
 generator client {
@@ -27,10 +27,14 @@ model User {
   email     String   @unique
   // bcrypt hash for email+password accounts (null = Clerk-only account)
   passwordHash String?
+  // Set when the user confirms their email via the emailed link.
+  emailVerifiedAt DateTime?
   name      String?
   avatarUrl String?
   bio       String?
   role      Role     @default(BUYER)
+  // Buyer-facing phone (used for order shipping contact).
+  phone     String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -42,6 +46,7 @@ model User {
   sellerReviewsGiven    SellerReview[] @relation("SellerReviewsGiven")
   sellerProfile    SellerProfile?
   wishlistItems    WishlistItem[]
+  authTokens       AuthToken[]
 
   @@map("users")
 }
@@ -50,6 +55,28 @@ enum Role {
   BUYER
   SELLER
   ADMIN
+}
+
+// ── Auth tokens (email verification / password reset) ─────
+
+model AuthToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      AuthTokenType
+  // SHA-256 of the emailed token — the raw token is never stored.
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, type])
+  @@map("auth_tokens")
+}
+
+enum AuthTokenType {
+  EMAIL_VERIFY
+  PASSWORD_RESET
 }
 
 // ── Seller Profile ────────────────────────────────────────
@@ -68,10 +95,41 @@ model SellerProfile {
   bannerUrl   String?
   isVerified  Boolean  @default(false)
   payoutEmail String?
+
+  // ── Seller governance (v4) ───────────────────────────────
+  // Every seller application moves through review. Only APPROVED
+  // sellers may publish products; SUSPENDED/BLOCKED lose that right.
+  sellerStatus       SellerStatus @default(PENDING)
+  // Contact + profile shown in the admin review screen
+  phone              String?
+  // Application lifecycle timestamps
+  appliedAt          DateTime?
+  approvedAt         DateTime?
+  rejectedAt         DateTime?
+  suspendedAt        DateTime?
+  // Sent to the seller when rejected (internal adminNote is NOT exposed)
+  rejectionReason    String?
+  adminNote          String?
+  // Terms acceptance audit trail
+  termsVersion       String?
+  termsAcceptedAt    DateTime?
+  // Category focus, free-text (e.g. "Handmade fashion & accessories")
+  category           String?
+
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   @@map("seller_profiles")
+}
+
+// Seller lifecycle. isVerified (above) mirrors APPROVED so existing
+// UI keeps working; the enum is the source of truth.
+enum SellerStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SUSPENDED
+  BLOCKED
 }
 
 // ── Categories (database-driven) ──────────────────────────
@@ -99,8 +157,8 @@ model Product {
   name          String
   slug          String        @unique // generated once at creation — stable for QR codes
   description   String
-  // Decimal(12,2): exact Naira + kobo, no float rounding errors.
-  // Prisma returns Decimal; serialize with toNumber()/toString().
+  // Decimal(12,2): exact Naira + kobo, no float arithmetic for Naira.
+  // Prisma returns Decimal; serialize with money()/toString().
   price         Decimal       @db.Decimal(12, 2)
   originalPrice Decimal?      @db.Decimal(12, 2)
   productType   ProductType   @default(PHYSICAL)
@@ -113,10 +171,18 @@ model Product {
   reviewCount   Int           @default(0) // aggregate from Review rows
   buyCount      Int           @default(0) // aggregate from paid OrderItems
   viewCount     Int           @default(0)
+  // Optional structured info shown on the product page
+  condition     String? // e.g. "Brand new" | "Refurbished" | "Used — excellent"
+  quantity      Int? // available units (physical stock)
+  digitalInfo   String? // file type / access info for digital products
   sellerId      String
   seller        User          @relation(fields: [sellerId], references: [id], onDelete: Cascade)
   categoryId    String?
   category      Category?     @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  // Moderation (v4): why an admin rejected/removed this listing
+  moderationReason String?
+  // When a moderation decision was made
+  moderatedAt      DateTime?
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt
 
@@ -139,7 +205,9 @@ enum ProductType {
 
 enum ProductStatus {
   DRAFT
+  PENDING_REVIEW
   PUBLISHED
+  REJECTED
   UNPUBLISHED
   REMOVED
 }
@@ -172,7 +240,7 @@ model Order {
   userId         String
   user           User          @relation(fields: [userId], references: [id])
   status         OrderStatus   @default(PENDING)
-  paymentStatus  PaymentStatus @default(UNPAID)
+  paymentStatus  PaymentStatus  @default(UNPAID)
   paymentRef     String? // Paystack reference
   subtotal       Decimal       @db.Decimal(12, 2)
   shipping       Decimal       @default(0) @db.Decimal(12, 2)
