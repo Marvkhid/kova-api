@@ -17,14 +17,13 @@ import {
 } from '@nestjs/common';
 import { AuthService } from '../auth.service';
 import { LocalAuthService } from '../local-auth.service';
-import { PrismaService } from '../../prisma/prisma.module';
+import { db } from '../../prisma/db';
 
 @Injectable()
 export class JwtAuthGuard implements CanActivate {
   constructor(
     private auth: AuthService,
     private localAuth: LocalAuthService,
-    private prisma: PrismaService,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -40,10 +39,10 @@ export class JwtAuthGuard implements CanActivate {
     // ── Path 1: local HS256 JWT (provider=local) ────────────
     const local = this.localAuth.verifyLocalToken(token);
     if (local) {
-      const user = await this.prisma.user.findUnique({
-        where: { id: local.sub },
-        include: { sellerProfile: true },
-      });
+      const user = await db.orm.public.User
+        .include('sellerProfile')
+        .where({ id: local.sub })
+        .first();
       if (!user) throw new UnauthorizedException('Account no longer exists');
       request.user = user;
       return true;

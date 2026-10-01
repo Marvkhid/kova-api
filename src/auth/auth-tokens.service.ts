@@ -1,5 +1,5 @@
 // ============================================================
-// KOVA API — Auth Tokens Service
+// KOVA API — Auth Tokens Service (Prisma 8)
 // Issues and consumes one-time, hashed, expiring tokens for
 // email verification and password reset.
 //   • Raw token: 32 random bytes, base64url — shown only in
@@ -11,7 +11,7 @@
 
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { randomBytes, createHash } from 'crypto';
-import { PrismaService } from '../prisma/prisma.module';
+import { db, now } from '../prisma/db';
 
 export type AuthTokenType = 'EMAIL_VERIFY' | 'PASSWORD_RESET';
 
@@ -22,8 +22,6 @@ const TTL: Record<AuthTokenType, number> = {
 
 @Injectable()
 export class AuthTokensService {
-  constructor(private prisma: PrismaService) {}
-
   private hash(raw: string): string {
     return createHash('sha256').update(raw).digest('hex');
   }
@@ -31,23 +29,23 @@ export class AuthTokensService {
   /** Issue a fresh token, invalidating any previous one of this type. */
   async issue(userId: string, type: AuthTokenType): Promise<string> {
     const raw = randomBytes(32).toString('base64url');
-    await this.prisma.authToken.deleteMany({ where: { userId, type } });
-    await this.prisma.authToken.create({
-      data: {
-        userId,
-        type,
-        tokenHash: this.hash(raw),
-        expiresAt: new Date(Date.now() + TTL[type]),
-      },
+    await db.orm.public.AuthToken.where({ userId, type }).delete();
+    await db.orm.public.AuthToken.create({
+      userId,
+      type,
+      tokenHash: this.hash(raw),
+      expiresAt: Temporal.PlainDateTime.from(
+        new Date(Date.now() + TTL[type]).toISOString().replace(/\.\d+Z$/, ''),
+      ),
     });
     return raw;
   }
 
   /** Validate + consume. Throws when invalid/expired/already used. */
   async consume(token: string, type: AuthTokenType): Promise<{ userId: string }> {
-    const row = await this.prisma.authToken.findUnique({
-      where: { tokenHash: this.hash(token) },
-    });
+    const row = await db.orm.public.AuthToken
+      .where({ tokenHash: this.hash(token) })
+      .first();
 
     if (!row || row.type !== type) {
       throw new BadRequestException('This link is invalid or has already been used');
@@ -55,13 +53,15 @@ export class AuthTokensService {
     if (row.usedAt) {
       throw new BadRequestException('This link has already been used');
     }
-    if (row.expiresAt.getTime() < Date.now()) {
+    // Naive `timestamp` column → PlainDateTime; interpret as local wall-clock
+    // (matching how the token was written from UTC now + TTL).
+    if (Date.parse(`${row.expiresAt.toString()}Z`) < Date.now()) {
       throw new BadRequestException('This link has expired — request a new one');
     }
 
-    await this.prisma.authToken.update({ where: { id: row.id }, data: { usedAt: new Date() } });
+    await db.orm.public.AuthToken.where({ id: row.id }).update({ usedAt: now() });
     // Prevent token-reuse across types with the same hash material
-    await this.prisma.authToken.deleteMany({ where: { userId: row.userId, type } });
+    await db.orm.public.AuthToken.where({ userId: row.userId, type }).delete();
     return { userId: row.userId };
   }
 }

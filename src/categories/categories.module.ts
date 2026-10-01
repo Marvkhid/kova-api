@@ -20,7 +20,7 @@ import {
 } from '@nestjs/common';
 import { IsBoolean, IsInt, IsOptional, IsString, Max, Min, MinLength } from 'class-validator';
 import { Type } from 'class-transformer';
-import { PrismaService } from '../prisma/prisma.module';
+import { db } from '../prisma/db';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard, Roles } from '../auth/guards/roles.guard';
 
@@ -45,8 +45,6 @@ export class UpdateCategoryDto {
 
 @Injectable()
 export class CategoriesService {
-  constructor(private prisma: PrismaService) {}
-
   private slugify(name: string): string {
     return name
       .toLowerCase()
@@ -57,17 +55,13 @@ export class CategoriesService {
 
   /** Public list with published-product counts. */
   async findAll() {
-    const categories = await this.prisma.category.findMany({
-      where: { isActive: true },
-      orderBy: { sortOrder: 'asc' },
-      include: {
-        _count: {
-          select: {
-            products: { where: { status: 'PUBLISHED' } },
-          },
-        },
-      },
-    });
+    const categories = await db.orm.public.Category
+      .where({ isActive: true })
+      .include('products', (products) =>
+        products.where({ status: 'PUBLISHED' }).count(),
+      )
+      .orderBy((c) => c.sortOrder.asc())
+      .all();
     return categories.map((c) => ({
       id: c.id,
       name: c.name,
@@ -75,58 +69,56 @@ export class CategoriesService {
       description: c.description,
       icon: c.icon,
       sortOrder: c.sortOrder,
-      productCount: c._count.products,
+      productCount: Number(c.products ?? 0),
     }));
   }
 
   async create(dto: CreateCategoryDto) {
     const slug = this.slugify(dto.name);
-    if (!slug) throw new BadRequestException('Invalid category name');
-    const exists = await this.prisma.category.findUnique({ where: { slug } });
+    if (!slug) {
+      throw new BadRequestException('Invalid category name');
+    }
+    const exists = await db.orm.public.Category.where({ slug }).first();
     if (exists) throw new ConflictException('A category with that name already exists');
-    return this.prisma.category.create({
-      data: {
-        name: dto.name,
-        slug,
-        description: dto.description,
-        icon: dto.icon,
-        sortOrder: dto.sortOrder ?? 99,
-      },
+    return db.orm.public.Category.create({
+      name: dto.name,
+      slug,
+      description: dto.description ?? null,
+      icon: dto.icon ?? null,
+      sortOrder: dto.sortOrder ?? 99,
     });
   }
 
   async update(id: string, dto: UpdateCategoryDto) {
-    const category = await this.prisma.category.findUnique({ where: { id } });
+    const category = await db.orm.public.Category.where({ id }).first();
     if (!category) throw new NotFoundException('Category not found');
 
     if (dto.name && dto.name !== category.name) {
       const slug = this.slugify(dto.name);
-      const clash = await this.prisma.category.findUnique({ where: { slug } });
+      const clash = await db.orm.public.Category.where({ slug }).first();
       if (clash && clash.id !== id) {
         throw new ConflictException('A category with that name already exists');
       }
-      return this.prisma.category.update({
-        where: { id },
-        data: { ...dto, slug },
-      });
+      return db.orm.public.Category.where({ id }).update({ ...dto, slug });
     }
 
-    return this.prisma.category.update({ where: { id }, data: dto });
+    return db.orm.public.Category.where({ id }).update(dto);
   }
 
   /** Delete only when the category has no products. */
   async remove(id: string) {
-    const category = await this.prisma.category.findUnique({
-      where: { id },
-      include: { _count: { select: { products: true } } },
-    });
+    const category = await db.orm.public.Category
+      .where({ id })
+      .include('products', (products) => products.count())
+      .first();
     if (!category) throw new NotFoundException('Category not found');
-    if (category._count.products > 0) {
+    const productCount = Number(category.products ?? 0);
+    if (productCount > 0) {
       throw new ConflictException(
-        `Cannot delete — ${category._count.products} product(s) still use this category`,
+        `Cannot delete — ${productCount} product(s) still use this category`,
       );
     }
-    await this.prisma.category.delete({ where: { id } });
+    await db.orm.public.Category.where({ id }).delete();
     return { message: 'Category deleted' };
   }
 }

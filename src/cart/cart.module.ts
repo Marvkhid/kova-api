@@ -1,5 +1,5 @@
 // ============================================================
-// KOVA API — Cart Module
+// KOVA API — Cart Module (Prisma 8)
 // Server-side cart for guests (sessionId) and users.
 // ============================================================
 
@@ -19,7 +19,7 @@ import {
 } from '@nestjs/common';
 import { IsString, IsNumber, Min } from 'class-validator';
 import { Type } from 'class-transformer';
-import { PrismaService } from '../prisma/prisma.module';
+import { db } from '../prisma/db';
 
 // ── DTOs ──────────────────────────────────────────────────
 
@@ -34,7 +34,7 @@ export class UpdateCartItemDto {
 
 // ── Service ───────────────────────────────────────────────
 
-/** Prisma Decimal → JSON-safe number (Naira, 2dp max). */
+/** Decimal → JSON-safe number (Naira, 2dp max). */
 export function money(value: unknown): number {
   if (value === null || value === undefined) return 0;
   return Number(value);
@@ -47,14 +47,12 @@ function serializeProduct<T extends { price: unknown; originalPrice?: unknown }>
 
 @Injectable()
 export class CartService {
-  constructor(private prisma: PrismaService) {}
-
   async getCart(sessionId: string) {
-    const items = await this.prisma.cartItem.findMany({
-      where: { sessionId },
-      include: { product: true },
-      orderBy: { createdAt: 'asc' },
-    });
+    const items = await db.orm.public.CartItem
+      .where({ sessionId })
+      .include('product')
+      .orderBy((item) => item.createdAt.asc())
+      .all();
 
     const serialized = items.map((item) => ({ ...item, product: serializeProduct(item.product) }));
 
@@ -72,21 +70,24 @@ export class CartService {
 
   async addItem(sessionId: string, dto: AddToCartDto) {
     // Verify product exists
-    const product = await this.prisma.product.findUnique({
-      where: { id: dto.productId },
-    });
+    const product = await db.orm.public.Product.where({ id: dto.productId }).first();
     if (!product) throw new NotFoundException('Product not found');
 
-    // Upsert — add or increment quantity
-    return this.prisma.cartItem.upsert({
-      where: { sessionId_productId: { sessionId, productId: dto.productId } },
-      update: { quantity: { increment: dto.quantity } },
-      create: {
-        sessionId,
-        productId: dto.productId,
-        quantity: dto.quantity,
-      },
-      include: { product: true },
+    // Upsert — add or increment quantity. Prisma 8 has no { increment } in
+    // updates, so the read-then-write runs inside a transaction.
+    return db.transaction(async (tx) => {
+      const existing = await tx.orm.public.CartItem
+        .where({ sessionId, productId: dto.productId })
+        .first();
+      if (existing) {
+        return tx.orm.public.CartItem
+          .where({ id: existing.id })
+          .include('product')
+          .update({ quantity: existing.quantity + dto.quantity });
+      }
+      return tx.orm.public.CartItem
+        .include('product')
+        .create({ sessionId, productId: dto.productId, quantity: dto.quantity });
     });
   }
 
@@ -99,22 +100,20 @@ export class CartService {
       return this.removeItem(sessionId, productId);
     }
 
-    return this.prisma.cartItem.update({
-      where: { sessionId_productId: { sessionId, productId } },
-      data: { quantity: dto.quantity },
-      include: { product: true },
-    });
+    const updated = await db.orm.public.CartItem
+      .where({ sessionId, productId })
+      .update({ quantity: dto.quantity });
+    if (!updated) throw new NotFoundException('Cart item not found');
+    return db.orm.public.CartItem.where({ id: updated.id }).include('product').first();
   }
 
   async removeItem(sessionId: string, productId: string) {
-    await this.prisma.cartItem.delete({
-      where: { sessionId_productId: { sessionId, productId } },
-    });
+    await db.orm.public.CartItem.where({ sessionId, productId }).delete();
     return { message: 'Item removed' };
   }
 
   async clearCart(sessionId: string) {
-    await this.prisma.cartItem.deleteMany({ where: { sessionId } });
+    await db.orm.public.CartItem.where({ sessionId }).deleteAll();
     return { message: 'Cart cleared' };
   }
 }

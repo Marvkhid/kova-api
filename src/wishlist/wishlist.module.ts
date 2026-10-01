@@ -1,5 +1,5 @@
 // ============================================================
-// KOVA API — Wishlist Module
+// KOVA API — Wishlist Module (Prisma 8)
 // Persistent wishlist for authenticated users.
 // GET    /api/wishlist            — my wishlist (products included)
 // POST   /api/wishlist/:productId — add
@@ -18,7 +18,7 @@ import {
   Post,
   UseGuards,
 } from '@nestjs/common';
-import { PrismaService } from '../prisma/prisma.module';
+import { db } from '../prisma/db';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 
@@ -26,71 +26,51 @@ import { CurrentUser } from '../auth/current-user.decorator';
 
 @Injectable()
 export class WishlistService {
-  constructor(private prisma: PrismaService) {}
-
   async getMyWishlist(userId: string) {
-    const items = await this.prisma.wishlistItem.findMany({
-      where: { userId },
-      orderBy: { createdAt: 'desc' },
-      include: {
-        product: {
-          select: {
-            id: true,
-            name: true,
-            slug: true,
-            price: true,
-            originalPrice: true,
-            productType: true,
-            images: true,
-            inStock: true,
-            status: true,
-            rating: true,
-            reviewCount: true,
-            category: { select: { name: true, slug: true } },
-            seller: {
-              select: {
-                id: true,
-                name: true,
-                sellerProfile: { select: { storeName: true } },
-              },
-            },
-          },
-        },
-      },
-    });
+    const items = await db.orm.public.WishlistItem
+      .where({ userId })
+      .include('product', (product) =>
+        product
+          .include('category', (category) => category.select('name', 'slug'))
+          .include('seller', (seller) =>
+            seller.include('sellerProfile', (profile) => profile.select('storeName')),
+          ),
+      )
+      .orderBy((item) => item.createdAt.desc())
+      .all();
     // Only show products that are still publicly available
-    return { items: items.filter((i) => i.product && i.product.status === 'PUBLISHED') };
+    return {
+      items: items.filter(
+        (i) => i.product && i.product.status === 'PUBLISHED',
+      ),
+    };
   }
 
   async add(userId: string, productId: string) {
-    const product = await this.prisma.product.findUnique({
-      where: { id: productId },
-      select: { id: true, status: true },
-    });
+    const product = await db.orm.public.Product
+      .where({ id: productId })
+      .select('id', 'status')
+      .first();
     if (!product || product.status !== 'PUBLISHED') {
       throw new NotFoundException('Product not found');
     }
 
-    const existing = await this.prisma.wishlistItem.findUnique({
-      where: { userId_productId: { userId, productId } },
-    });
+    const existing = await db.orm.public.WishlistItem
+      .where({ userId, productId })
+      .first();
     if (existing) return existing;
 
-    return this.prisma.wishlistItem.create({
-      data: { userId, productId },
-    });
+    return db.orm.public.WishlistItem.create({ userId, productId });
   }
 
   async remove(userId: string, productId: string) {
-    const item = await this.prisma.wishlistItem.findUnique({
-      where: { userId_productId: { userId, productId } },
-    });
+    const item = await db.orm.public.WishlistItem
+      .where({ userId, productId })
+      .first();
     if (!item) throw new NotFoundException('Not in your wishlist');
     if (item.userId !== userId) throw new ForbiddenException('Not your wishlist item');
 
-    await this.prisma.wishlistItem.delete({
-      where: { id: item.id },
-    });
+    await db.orm.public.WishlistItem.where({ id: item.id }).delete();
     return { message: 'Removed from wishlist' };
   }
 }

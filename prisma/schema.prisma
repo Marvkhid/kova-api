@@ -11,12 +11,18 @@
 // ============================================================
 
 generator client {
-  provider = "prisma-client-js"
+  provider = "prisma-client"
+  // Prisma 8 does not use this generator block: `prisma contract emit`
+  // (configured in prisma.config.ts) compiles this schema into the
+  // contract at src/generated/prisma8. The block stays because the
+  // v8 config reads this file as a Prisma 7 schema (prisma7Schema()).
+  output   = "../src/generated/prisma"
+  moduleFormat = "cjs"
 }
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
+  // Connection URL now lives in prisma.config.ts (Prisma 7+ requirement).
 }
 
 // ── Users ─────────────────────────────────────────────────

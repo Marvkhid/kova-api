@@ -1,5 +1,5 @@
 // ============================================================
-// KOVA API — Sellers Module
+// KOVA API — Sellers Module (Prisma 8)
 // Seller onboarding + governance + honest dashboard analytics.
 //
 // Lifecycle (v4):
@@ -29,7 +29,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { IsString, IsOptional, IsEmail, MinLength, MaxLength, Matches } from 'class-validator';
-import { PrismaService } from '../prisma/prisma.module';
+import { db, now } from '../prisma/db';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { MailerService } from '../auth/mailer.service';
@@ -70,16 +70,13 @@ export class ApplySellerDto {
 
 @Injectable()
 export class SellersService {
-  constructor(
-    private prisma: PrismaService,
-    private mailer: MailerService,
-  ) {}
+  constructor(private mailer: MailerService) {}
 
   /** Become a seller — same account, role upgraded, starts PENDING. */
   async createProfile(user: any, dto: CreateSellerProfileDto) {
-    const existing = await this.prisma.sellerProfile.findUnique({
-      where: { userId: user.id },
-    });
+    const existing = await db.orm.public.SellerProfile
+      .where({ userId: user.id })
+      .first();
     if (existing) throw new ConflictException('You already have a seller profile');
 
     const baseSlug =
@@ -92,23 +89,18 @@ export class SellersService {
     // Collision-safe store slug
     let slug = baseSlug;
     let n = 2;
-    while (await this.prisma.sellerProfile.findUnique({ where: { storeSlug: slug } })) {
+    while (await db.orm.public.SellerProfile.where({ storeSlug: slug }).first()) {
       slug = `${baseSlug}-${n++}`;
     }
 
-    return this.prisma.$transaction(async (tx) => {
-      await tx.user.update({
-        where: { id: user.id },
-        data: { role: 'SELLER' },
-      });
-      return tx.sellerProfile.create({
-        data: {
-          userId: user.id,
-          storeName: dto.storeName,
-          storeSlug: slug,
-          description: dto.description,
-          sellerStatus: 'PENDING',
-        },
+    return db.transaction(async (tx) => {
+      await tx.orm.public.User.where({ id: user.id }).update({ role: 'SELLER' });
+      return tx.orm.public.SellerProfile.create({
+        userId: user.id,
+        storeName: dto.storeName,
+        storeSlug: slug,
+        description: dto.description ?? null,
+        sellerStatus: 'PENDING',
       });
     });
   }
@@ -118,18 +110,15 @@ export class SellersService {
    * may edit and re-apply; approved ones keep their storefront fresh.
    */
   async updateProfile(user: any, dto: UpdateSellerProfileDto) {
-    const profile = await this.prisma.sellerProfile.findUnique({
-      where: { userId: user.id },
-    });
+    const profile = await db.orm.public.SellerProfile
+      .where({ userId: user.id })
+      .first();
     if (!profile) throw new NotFoundException('Seller profile not found');
     if (profile.sellerStatus === 'BLOCKED') {
       throw new ForbiddenException('This seller account is blocked');
     }
 
-    return this.prisma.sellerProfile.update({
-      where: { userId: user.id },
-      data: dto,
-    });
+    return db.orm.public.SellerProfile.where({ userId: user.id }).update(dto);
   }
 
   /**
@@ -144,9 +133,9 @@ export class SellersService {
       );
     }
 
-    const profile = await this.prisma.sellerProfile.findUnique({
-      where: { userId: user.id },
-    });
+    const profile = await db.orm.public.SellerProfile
+      .where({ userId: user.id })
+      .first();
     if (!profile) throw new NotFoundException('Create your seller profile first');
 
     if (profile.sellerStatus === 'APPROVED') {
@@ -165,27 +154,24 @@ export class SellersService {
       );
     }
 
-    const updated = await this.prisma.sellerProfile.update({
-      where: { userId: user.id },
-      data: {
+    const updated = await db.orm.public.SellerProfile
+      .where({ userId: user.id })
+      .update({
         sellerStatus: 'PENDING',
-        appliedAt: new Date(),
+        appliedAt: now(),
         rejectedAt: null,
         rejectionReason: null,
         termsVersion: dto.termsVersion,
-        termsAcceptedAt: new Date(),
-      },
-    });
+        termsAcceptedAt: now(),
+      });
     return { profile: updated, message: 'Application submitted — our team will review it shortly.' };
   }
 
   async getProfile(user: any) {
-    const profile = await this.prisma.sellerProfile.findUnique({
-      where: { userId: user.id },
-      include: {
-        user: { select: { name: true, email: true, avatarUrl: true, phone: true } },
-      },
-    });
+    const profile = await db.orm.public.SellerProfile
+      .where({ userId: user.id })
+      .include('user', (u) => u.select('name', 'email', 'avatarUrl', 'phone'))
+      .first();
     if (!profile) throw new NotFoundException('Seller profile not found');
     return profile;
   }
@@ -193,34 +179,21 @@ export class SellersService {
   /** Dashboard stats — computed live, honest zeros when empty. */
   async getDashboardStats(userId: string) {
     const [products, paidOrderItems, sellerProfile] = await Promise.all([
-      this.prisma.product.findMany({
-        where: { sellerId: userId },
-        orderBy: { createdAt: 'desc' },
-        select: {
-          id: true,
-          name: true,
-          slug: true,
-          price: true,
-          productType: true,
-          status: true,
-          images: true,
-          viewCount: true,
-          buyCount: true,
-          rating: true,
-          reviewCount: true,
-          moderationReason: true,
-          createdAt: true,
-          category: { select: { name: true, slug: true } },
-        },
-      }),
-      this.prisma.orderItem.findMany({
-        where: {
-          product: { sellerId: userId },
-          order: { paymentStatus: 'PAID' },
-        },
-        select: { quantity: true, price: true, createdAt: true },
-      }),
-      this.prisma.sellerProfile.findUnique({ where: { userId } }),
+      db.orm.public.Product
+        .where({ sellerId: userId })
+        .include('category', (c) => c.select('name', 'slug'))
+        .select(
+          'id', 'name', 'slug', 'price', 'productType', 'status', 'images',
+          'viewCount', 'buyCount', 'rating', 'reviewCount', 'moderationReason', 'createdAt',
+        )
+        .orderBy((p) => p.createdAt.desc())
+        .all(),
+      db.orm.public.OrderItem
+        .where((item) => item.order.some({ paymentStatus: 'PAID' }))
+        .where((item) => item.product.some({ sellerId: userId }))
+        .select('quantity', 'price', 'createdAt')
+        .all(),
+      db.orm.public.SellerProfile.where({ userId }).first(),
     ]);
     // A user without a seller profile has no seller dashboard — signal
     // the onboarding gate (/sell) with 404 rather than an empty shell.
@@ -270,45 +243,40 @@ export class SellersService {
    * from discovery the moment moderation flips their status.
    */
   async listFeatured(limit = 8) {
-    const profiles = await this.prisma.sellerProfile.findMany({
-      where: {
-        sellerStatus: 'APPROVED',
-        user: { products: { some: { status: 'PUBLISHED' } } },
-      },
-      include: {
-        user: {
-          select: {
-            id: true,
-            name: true,
-            avatarUrl: true,
-            products: {
-              where: { status: 'PUBLISHED' },
-              orderBy: [{ rating: 'desc' }, { reviewCount: 'desc' }],
-              take: 3,
-              select: {
-                id: true, name: true, slug: true, price: true, images: true,
-                rating: true, reviewCount: true, productType: true,
-              },
-            },
-          },
-        },
-      },
-    });
+    const profiles = await db.orm.public.SellerProfile
+      .where({ sellerStatus: 'APPROVED' })
+      .where((profile) => profile.user.some((u) => u.products.some({ status: 'PUBLISHED' })))
+      .include('user', (u) =>
+        u.include('products', (products) =>
+          products
+            .where({ status: 'PUBLISHED' })
+            .select(
+              'id', 'name', 'slug', 'price', 'images',
+              'rating', 'reviewCount', 'productType',
+            )
+            .orderBy((pr) => pr.rating.desc())
+            .orderBy((pr) => pr.reviewCount.desc())
+            .limit(3),
+        ),
+      )
+      .all();
 
-    // Product counts + rating aggregates in one grouped query
-    const grouped = await this.prisma.product.groupBy({
-      by: ['sellerId'],
-      where: { status: 'PUBLISHED', seller: { sellerProfile: { sellerStatus: 'APPROVED' } } },
-      _count: { _all: true },
-    });
-    const stats = new Map(grouped.map((g) => [g.sellerId, { count: g._count._all }]));
+    // Product counts in one grouped query
+    const grouped = await db.orm.public.Product
+      .where({ status: 'PUBLISHED' })
+      .where((p) => p.seller.some((s) => s.sellerProfile.some({ sellerStatus: 'APPROVED' })))
+      .groupBy('sellerId')
+      .aggregate((a) => ({ count: a.count() }));
+    const stats = new Map(grouped.map((g) => [g.sellerId, { count: Number(g.count) }]));
 
     // Store rating = average across RATED products only (zeros excluded,
     // matching the seller dashboard's honest math).
-    const ratedRows = await this.prisma.product.findMany({
-      where: { status: 'PUBLISHED', reviewCount: { gt: 0 }, seller: { sellerProfile: { sellerStatus: 'APPROVED' } } },
-      select: { sellerId: true, rating: true },
-    });
+    const ratedRows = await db.orm.public.Product
+      .where({ status: 'PUBLISHED' })
+      .where((p) => p.reviewCount.gt(0))
+      .where((p) => p.seller.some((s) => s.sellerProfile.some({ sellerStatus: 'APPROVED' })))
+      .select('sellerId', 'rating')
+      .all();
     const ratedSum = new Map<string, { sum: number; n: number }>();
     for (const r of ratedRows) {
       const cur = ratedSum.get(r.sellerId) ?? { sum: 0, n: 0 };
@@ -332,7 +300,7 @@ export class SellersService {
           isVerified: p.sellerStatus === 'APPROVED',
           productCount: s.count,
           avgRating: rated ? Math.round((rated.sum / rated.n) * 10) / 10 : null,
-          previewProducts: p.user.products.map((pr) => ({ ...pr, price: Number(pr.price) })),
+          previewProducts: (p.user as any).products.map((pr: any) => ({ ...pr, price: Number(pr.price) })),
         };
       })
       .sort((a, b) => b.productCount - a.productCount || (b.avgRating ?? 0) - (a.avgRating ?? 0))
@@ -343,74 +311,67 @@ export class SellersService {
   // Public store page
   /** Public store page (paginated catalogue). APPROVED sellers only. */
   async getPublicStore(slug: string, page = 1, limit = 20) {
-    const profile = await this.prisma.sellerProfile.findUnique({
-      where: { storeSlug: slug },
-      include: {
-        user: {
-          select: {
-            id: true,
-            name: true,
-            bio: true,
-            avatarUrl: true,
-            createdAt: true,
-            _count: { select: { products: { where: { status: 'PUBLISHED' } } } },
-            products: {
-              where: { status: 'PUBLISHED' },
-              orderBy: { createdAt: 'desc' },
-              skip: (page - 1) * limit,
-              take: limit,
-              select: {
-                id: true,
-                name: true,
-                slug: true,
-                price: true,
-                productType: true,
-                images: true,
-                rating: true,
-                reviewCount: true,
-                createdAt: true,
-                category: { select: { name: true, slug: true } },
-              },
-            },
-          },
-        },
-      },
-    });
+    const profile = await db.orm.public.SellerProfile
+      .where({ storeSlug: slug })
+      .include('user', (u) =>
+        u
+          .select('id', 'name', 'bio', 'avatarUrl', 'createdAt')
+          .include('products', (products) =>
+            products
+              .where({ status: 'PUBLISHED' })
+              .select(
+                'id', 'name', 'slug', 'price', 'productType',
+                'images', 'rating', 'reviewCount', 'createdAt',
+              )
+              .include('category', (c) => c.select('name', 'slug'))
+              .orderBy((p) => p.createdAt.desc())
+              .offset((page - 1) * limit)
+              .limit(limit),
+          ),
+      )
+      .first();
     if (!profile) throw new NotFoundException('Store not found');
     // Governance: only approved storefronts are publicly browsable.
     if (profile.sellerStatus !== 'APPROVED') {
       throw new NotFoundException('Store not found');
     }
 
-    // Distinct categories across the store's published catalogue
-    const categoryRows = await this.prisma.product.findMany({
-      where: { sellerId: profile.userId, status: 'PUBLISHED', categoryId: { not: null } },
-      select: { category: { select: { name: true, slug: true } } },
-      distinct: ['categoryId'],
-    });
+    // Published-product total for pagination (separate count query)
+    const totalAgg = await db.orm.public.Product
+      .where({ sellerId: profile.userId, status: 'PUBLISHED' })
+      .aggregate((a) => ({ total: a.count() }));
 
-    const total = profile.user._count.products;
+    // Distinct categories across the store's published catalogue
+    const categoryRows = await db.orm.public.Product
+      .where({ sellerId: profile.userId, status: 'PUBLISHED' })
+      .where((p) => p.categoryId.isNotNull())
+      .include('category', (c) => c.select('name', 'slug'))
+      .distinct('categoryId')
+      .all();
+
+    const user = profile.user as any;
+    const total = Number(totalAgg.total);
     // Decimal prices → JSON-safe numbers on the public store payload
     return {
       id: profile.id,
       userId: profile.userId,
       storeName: profile.storeName,
       storeSlug: profile.storeSlug,
-      description: profile.description ?? profile.user.bio,
+      description: profile.description ?? user.bio,
       location: profile.location,
       logoUrl: profile.logoUrl,
       bannerUrl: profile.bannerUrl,
       isVerified: profile.sellerStatus === 'APPROVED',
       category: profile.category,
-      ownerName: profile.user.name,
-      ownerAvatarUrl: profile.user.avatarUrl,
-      joinedAt: profile.user.createdAt,
-      categories: categoryRows.map((c) => c.category).filter(Boolean),
+      ownerName: user.name,
+      ownerAvatarUrl: user.avatarUrl,
+      joinedAt: user.createdAt,
+      categories: categoryRows.map((c: any) => c.category).filter(Boolean),
       totalProducts: total,
       page,
       limit,
       pages: Math.ceil(total / limit),
-      products: profile.user.products.map((p) => ({
+      products: user.products.map((p: any) => ({
         ...p,
         price: Number(p.price),
       })),
@@ -419,11 +380,11 @@ export class SellersService {
 
   /** Public store slugs — consumed by the frontend sitemap. APPROVED only. */
   async listStoreSlugs() {
-    const stores = await this.prisma.sellerProfile.findMany({
-      where: { sellerStatus: 'APPROVED' },
-      select: { storeSlug: true },
-      orderBy: { createdAt: 'asc' },
-    });
+    const stores = await db.orm.public.SellerProfile
+      .where({ sellerStatus: 'APPROVED' })
+      .select('storeSlug')
+      .orderBy((s) => s.createdAt.asc())
+      .all();
     return { stores };
   }
 }

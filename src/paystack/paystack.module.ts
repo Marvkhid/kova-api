@@ -21,7 +21,7 @@ import { ConfigService } from '@nestjs/config';
 import { IsNumber, IsOptional, IsString, IsEmail, Min } from 'class-validator';
 import { Type } from 'class-transformer';
 import { createHmac } from 'crypto';
-import { PrismaService } from '../prisma/prisma.module';
+import { db } from '../prisma/db';
 import { OrdersModule, OrdersService } from '../orders/orders.module';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
@@ -45,7 +45,6 @@ export class PaystackService {
 
   constructor(
     private config: ConfigService,
-    private prisma: PrismaService,
     private orders: OrdersService,
   ) {
     this.secretKey = this.config.get<string>('PAYSTACK_SECRET_KEY') ?? '';
@@ -53,9 +52,9 @@ export class PaystackService {
 
   // Initialize a payment — returns authorization URL
   async initializePayment(dto: InitializePaymentDto, userId: string) {
-    const order = await this.prisma.order.findFirst({
-      where: { id: dto.orderId, userId },
-    });
+    const order = await db.orm.public.Order
+      .where({ id: dto.orderId, userId })
+      .first();
     if (!order) throw new BadRequestException('Order not found');
 
     const response = await fetch(`${this.baseUrl}/transaction/initialize`, {
@@ -128,10 +127,9 @@ export class PaystackService {
       case 'refund.processed': {
         const { metadata } = event.data;
         if (metadata?.orderId) {
-          await this.prisma.order.update({
-            where: { id: metadata.orderId },
-            data: { status: 'REFUNDED', paymentStatus: 'REFUNDED' },
-          });
+          await db.orm.public.Order
+            .where({ id: metadata.orderId })
+            .update({ status: 'REFUNDED', paymentStatus: 'REFUNDED' });
         }
         break;
       }

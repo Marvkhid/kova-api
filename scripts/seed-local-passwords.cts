@@ -1,13 +1,12 @@
 // ============================================================
 // KOVA — Seed local (email+password) credentials for demo users
 // Idempotent: only sets passwordHash when it is currently null.
-// Run: npx ts-node scripts/seed-local-passwords.ts
+// Run: node -r ts-node/register/transpile-only scripts/seed-local-passwords.cts
 // ============================================================
 
-import { PrismaClient } from '@prisma/client';
+import { db } from '../src/prisma/db';
+import 'dotenv/config';
 import * as bcrypt from 'bcryptjs';
-
-const prisma = new PrismaClient();
 
 const TARGETS: Array<{ email: string; password: string; role: 'BUYER' | 'SELLER' }> = [
   { email: 'kova.buyer1@kova.dev', password: 'KovaDemo!2026', role: 'BUYER' },
@@ -16,7 +15,7 @@ const TARGETS: Array<{ email: string; password: string; role: 'BUYER' | 'SELLER'
 
 async function main() {
   for (const t of TARGETS) {
-    const user = await prisma.user.findUnique({ where: { email: t.email } });
+    const user = await db.orm.public.User.where({ email: t.email }).first();
     if (!user) {
       console.log(`SKIP (not found): ${t.email}`);
       continue;
@@ -26,9 +25,9 @@ async function main() {
       continue;
     }
     const hash = await bcrypt.hash(t.password, 10);
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { passwordHash: hash, role: t.role },
+    await db.orm.public.User.where({ id: user.id }).update({
+      passwordHash: hash,
+      role: t.role,
     });
     console.log(`OK: local password set for ${t.email} (${t.role})`);
   }
@@ -39,4 +38,4 @@ main()
     console.error(e);
     process.exit(1);
   })
-  .finally(() => prisma.$disconnect());
+  .then(() => db.close());

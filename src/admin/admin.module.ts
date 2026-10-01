@@ -1,5 +1,5 @@
 // ============================================================
-// KOVA API — Admin Module
+// KOVA API — Admin Module (Prisma 8)
 // ADMIN-only. Real metrics only — nothing is fabricated.
 // GET    /api/admin/overview          — marketplace metrics
 // GET    /api/admin/users             — user list
@@ -28,7 +28,8 @@ import {
 } from '@nestjs/common';
 import { IsEnum, IsNumber, IsOptional, IsString, Max, Min, MaxLength } from 'class-validator';
 import { Type } from 'class-transformer';
-import { PrismaService } from '../prisma/prisma.module';
+import { db, now } from '../prisma/db';
+import { rawRows } from '../prisma/raw-helper';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard, Roles } from '../auth/guards/roles.guard';
 import { MailerService } from '../auth/mailer.service';
@@ -77,15 +78,12 @@ class AdminQueryDto {
 export class AdminService {
   private readonly logger = new Logger(AdminService.name);
 
-  constructor(
-    private prisma: PrismaService,
-    private mailer: MailerService,
-  ) {}
+  constructor(private mailer: MailerService) {}
 
   /** Real, database-computed metrics — no estimates. */
   async getOverview() {
-    const now = new Date();
-    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const nowTs = new Date();
+    const startOfToday = new Date(nowTs.getFullYear(), nowTs.getMonth(), nowTs.getDate());
     const weekAgo = new Date(startOfToday.getTime() - 7 * 24 * 60 * 60 * 1000);
 
     const [
@@ -108,169 +106,178 @@ export class AdminService {
       pendingReviewProducts,
       rejectedProducts,
     ] = await Promise.all([
-      this.prisma.user.count(),
-      this.prisma.user.count({ where: { role: 'SELLER' } }),
-      this.prisma.product.count(),
-      this.prisma.product.count({ where: { status: 'PUBLISHED' } }),
-      this.prisma.product.count({ where: { status: 'DRAFT' } }),
-      this.prisma.product.count({ where: { productType: 'DIGITAL' } }),
-      this.prisma.product.count({ where: { productType: 'PHYSICAL' } }),
-      this.prisma.product.count({ where: { createdAt: { gte: startOfToday } } }),
-      this.prisma.product.count({ where: { createdAt: { gte: weekAgo } } }),
-      this.prisma.product.aggregate({ _sum: { viewCount: true } }),
-      this.prisma.order.count(),
-      this.prisma.order.count({ where: { paymentStatus: 'PAID' } }),
-      this.prisma.user.groupBy({ by: ['role'], _count: true }),
-      this.prisma.sellerProfile.count({ where: { sellerStatus: 'PENDING' } }),
-      this.prisma.sellerProfile.count({ where: { sellerStatus: 'APPROVED' } }),
-      this.prisma.sellerProfile.count({ where: { sellerStatus: { in: ['SUSPENDED', 'BLOCKED'] } } }),
-      this.prisma.product.count({ where: { status: 'PENDING_REVIEW' } }),
-      this.prisma.product.count({ where: { status: 'REJECTED' } }),
+      db.orm.public.User.aggregate((a) => ({ total: a.count() })),
+      db.orm.public.User.where({ role: 'SELLER' }).aggregate((a) => ({ total: a.count() })),
+      db.orm.public.Product.aggregate((a) => ({ total: a.count() })),
+      db.orm.public.Product.where({ status: 'PUBLISHED' }).aggregate((a) => ({ total: a.count() })),
+      db.orm.public.Product.where({ status: 'DRAFT' }).aggregate((a) => ({ total: a.count() })),
+      db.orm.public.Product.where({ productType: 'DIGITAL' }).aggregate((a) => ({ total: a.count() })),
+      db.orm.public.Product.where({ productType: 'PHYSICAL' }).aggregate((a) => ({ total: a.count() })),
+      db.orm.public.Product.where((p) => p.createdAt.gte(Temporal.PlainDateTime.from(startOfToday.toISOString().replace(/\.\d+Z$/, '')))).aggregate((a) => ({ total: a.count() })),
+      db.orm.public.Product.where((p) => p.createdAt.gte(Temporal.PlainDateTime.from(weekAgo.toISOString().replace(/\.\d+Z$/, '')))).aggregate((a) => ({ total: a.count() })),
+      db.orm.public.Product.aggregate((a) => ({ views: a.sum('viewCount') })),
+      db.orm.public.Order.aggregate((a) => ({ total: a.count() })),
+      db.orm.public.Order.where({ paymentStatus: 'PAID' }).aggregate((a) => ({ total: a.count() })),
+      db.orm.public.User.groupBy('role').aggregate((a) => ({ count: a.count() })),
+      db.orm.public.SellerProfile.where({ sellerStatus: 'PENDING' }).aggregate((a) => ({ total: a.count() })),
+      db.orm.public.SellerProfile.where({ sellerStatus: 'APPROVED' }).aggregate((a) => ({ total: a.count() })),
+      db.orm.public.SellerProfile
+        .where((sp) => sp.sellerStatus.in(['SUSPENDED', 'BLOCKED']))
+        .aggregate((a) => ({ total: a.count() })),
+      db.orm.public.Product.where({ status: 'PENDING_REVIEW' }).aggregate((a) => ({ total: a.count() })),
+      db.orm.public.Product.where({ status: 'REJECTED' }).aggregate((a) => ({ total: a.count() })),
     ]);
 
     const roleCounts: Record<string, number> = { BUYER: 0, SELLER: 0, ADMIN: 0 };
-    for (const g of usersByRole) roleCounts[g.role] = g._count;
+    for (const g of usersByRole) roleCounts[g.role] = Number(g.count);
 
     return {
       users: {
-        total: totalUsers,
+        total: Number(totalUsers.total),
         buyers: roleCounts.BUYER,
         sellers: roleCounts.SELLER,
         admins: roleCounts.ADMIN,
       },
       moderation: {
         // Clickable cards on the admin dashboard → seller/product queues
-        pendingSellerApplications: pendingSellers,
-        approvedSellers,
-        suspendedSellers,
-        pendingProductReviews: pendingReviewProducts,
-        rejectedProducts,
+        pendingSellerApplications: Number(pendingSellers.total),
+        approvedSellers: Number(approvedSellers.total),
+        suspendedSellers: Number(suspendedSellers.total),
+        pendingProductReviews: Number(pendingReviewProducts.total),
+        rejectedProducts: Number(rejectedProducts.total),
       },
       products: {
-        total: totalProducts,
-        published: publishedProducts,
-        drafts: draftProducts,
-        digital: digitalProducts,
-        physical: physicalProducts,
-        addedToday: productsToday,
-        addedThisWeek: productsThisWeek,
+        total: Number(totalProducts.total),
+        published: Number(publishedProducts.total),
+        drafts: Number(draftProducts.total),
+        digital: Number(digitalProducts.total),
+        physical: Number(physicalProducts.total),
+        addedToday: Number(productsToday.total),
+        addedThisWeek: Number(productsThisWeek.total),
       },
       engagement: {
-        totalProductViews: totalViews._sum.viewCount ?? 0,
+        totalProductViews: Number(totalViews.views ?? 0),
       },
       orders: {
-        total: totalOrders,
-        paid: paidOrders,
+        total: Number(totalOrders.total),
+        paid: Number(paidOrders.total),
       },
-      generatedAt: now.toISOString(),
+      generatedAt: nowTs.toISOString(),
     };
   }
 
   async listUsers(query: AdminQueryDto) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 50;
-    const where = query.q
-      ? {
-          OR: [
-            { name: { contains: query.q, mode: 'insensitive' as const } },
-            { email: { contains: query.q, mode: 'insensitive' as const } },
-          ],
-        }
-      : {};
+    const q = query.q?.trim().toLowerCase();
+    const term = q ? `%${q}%` : null;
 
-    const [users, total] = await Promise.all([
-      this.prisma.user.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        take: limit,
-        skip: (page - 1) * limit,
-        select: {
-          id: true,
-          clerkId: true,
-          email: true,
-          name: true,
-          avatarUrl: true,
-          role: true,
-          createdAt: true,
-          sellerProfile: { select: { storeName: true, storeSlug: true } },
-          _count: { select: { products: true } },
-        },
-      }),
-      this.prisma.user.count({ where }),
+    let chain = db.orm.public.User
+      .include('sellerProfile', (sp: any) => sp.select('storeName', 'storeSlug'));
+    if (term) {
+      chain = chain.where((u) =>
+        db.orm.public.User === null ? (false as never) : u.name.ilike(term),
+      );
+    }
+
+    // Product count per user comes from a grouped query (v8 has no _count).
+    const base = term
+      ? db.orm.public.User.where((u) => u.name.ilike(term))
+          .where((u) => u.email.ilike(term))
+      : db.orm.public.User;
+
+    const [users, totalAgg, productCounts] = await Promise.all([
+      chain
+        .orderBy((u) => u.createdAt.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+        .all(),
+      base.aggregate((a) => ({ total: a.count() })),
+      db.orm.public.Product.groupBy('sellerId').aggregate((a) => ({ count: a.count() })),
     ]);
-    return { users, total, page, limit, pages: Math.ceil(total / limit) };
+    const countMap = new Map(productCounts.map((g) => [g.sellerId, Number(g.count)]));
+    const total = Number(totalAgg.total);
+
+    return {
+      users: users.map((u) => ({
+        id: u.id,
+        clerkId: u.clerkId,
+        email: u.email,
+        name: u.name,
+        avatarUrl: u.avatarUrl,
+        role: u.role,
+        createdAt: u.createdAt,
+        sellerProfile: u.sellerProfile,
+        _count: { products: countMap.get(u.id) ?? 0 },
+      })),
+      total,
+      page,
+      limit,
+      pages: Math.ceil(total / limit),
+    };
   }
 
   async updateUserRole(id: string, role: 'BUYER' | 'SELLER' | 'ADMIN') {
-    const user = await this.prisma.user.findUnique({ where: { id } });
+    const user = await db.orm.public.User.where({ id }).first();
     if (!user) throw new NotFoundException('User not found');
-    return this.prisma.user.update({
-      where: { id },
-      data: { role },
-      select: { id: true, email: true, role: true },
-    });
+    const updated = await db.orm.public.User.where({ id }).update({ role });
+    return { id: updated!.id, email: updated!.email, role: updated!.role };
   }
 
   async listProducts(query: AdminQueryDto) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 50;
-    const where: any = {};
-    if (query.status) where.status = query.status.toUpperCase();
-    if (query.q) {
-      where.OR = [
-        { name: { contains: query.q, mode: 'insensitive' } },
-        { seller: { email: { contains: query.q, mode: 'insensitive' } } },
-        { seller: { name: { contains: query.q, mode: 'insensitive' } } },
-      ];
+    const term = query.q?.trim().toLowerCase();
+    const like = term ? `%${term}%` : null;
+
+    let chain = db.orm.public.Product
+      .include('category', (c: any) => c.select('name', 'slug'))
+      .include('seller', (s: any) =>
+        s
+          .select('id', 'name', 'email')
+          .include('sellerProfile', (sp: any) => sp.select('storeName', 'storeSlug')),
+      )
+      .select('id', 'name', 'slug', 'price', 'productType', 'status', 'images', 'viewCount', 'buyCount', 'createdAt');
+    if (query.status) {
+      chain = chain.where({ status: query.status.toUpperCase() as never });
+    }
+    if (like) {
+      const nameRows = await db.orm.public.Product.where((p) => p.name.ilike(like)).select('id').all();
+      const sellerRows = await db.orm.public.User
+        .where((u) => u.email.ilike(like))
+        .select('id')
+        .all();
+      const sellerByName = await db.orm.public.User
+        .where((u) => u.name.ilike(like))
+        .select('id')
+        .all();
+      const ids = new Set<string>([...nameRows.map((r) => r.id), ...sellerRows.map((r) => r.id), ...sellerByName.map((r) => r.id)]);
+      chain = chain.where((p) => p.id.in([...ids]));
     }
 
-    const [products, total] = await Promise.all([
-      this.prisma.product.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        take: limit,
-        skip: (page - 1) * limit,
-        select: {
-          id: true,
-          name: true,
-          slug: true,
-          price: true,
-          productType: true,
-          status: true,
-          images: true,
-          viewCount: true,
-          buyCount: true,
-          createdAt: true,
-          category: { select: { name: true, slug: true } },
-          seller: {
-            select: {
-              id: true,
-              name: true,
-              email: true,
-              sellerProfile: { select: { storeName: true, storeSlug: true } },
-            },
-          },
-        },
-      }),
-      this.prisma.product.count({ where }),
+    const [products, totalAgg] = await Promise.all([
+      chain
+        .orderBy((p) => p.createdAt.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+        .all(),
+      chain.aggregate((a) => ({ total: a.count() })),
     ]);
+    const total = Number(totalAgg.total);
     return { products, total, page, limit, pages: Math.ceil(total / limit) };
   }
 
   async updateProductStatus(id: string, status: string) {
-    const product = await this.prisma.product.findUnique({ where: { id } });
+    const product = await db.orm.public.Product.where({ id }).first();
     if (!product) throw new NotFoundException('Product not found');
-    return this.prisma.product.update({
-      where: { id },
-      data: { status: status as any },
-      select: { id: true, slug: true, status: true },
-    });
+    const updated = await db.orm.public.Product.where({ id }).update({ status: status as never });
+    return { id: updated!.id, slug: updated!.slug, status: updated!.status };
   }
 
   async deleteProduct(id: string) {
-    const product = await this.prisma.product.findUnique({ where: { id } });
+    const product = await db.orm.public.Product.where({ id }).first();
     if (!product) throw new NotFoundException('Product not found');
-    await this.prisma.product.delete({ where: { id } });
+    await db.orm.public.Product.where({ id }).delete();
     return { message: 'Product deleted' };
   }
 
@@ -278,25 +285,22 @@ export class AdminService {
 
   /** Seller applications queue (optionally filtered by status). */
   async listSellerApplications(status?: string) {
-    const where = status
-      ? { sellerStatus: status.toUpperCase() as any }
-      : {};
-    const sellers = await this.prisma.sellerProfile.findMany({
-      where,
-      orderBy: [{ appliedAt: 'desc' }, { createdAt: 'desc' }],
-      include: {
-        user: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-            avatarUrl: true,
-            createdAt: true,
-            _count: { select: { products: true } },
-          },
-        },
-      },
-    });
+    let chain = db.orm.public.SellerProfile
+      .include('user', (u: any) => u.select('id', 'name', 'email', 'avatarUrl', 'createdAt'));
+    if (status) {
+      chain = chain.where({ sellerStatus: status.toUpperCase() as never });
+    }
+    const sellers = await chain
+      .orderBy((s) => s.appliedAt.desc())
+      .orderBy((s) => s.createdAt.desc())
+      .all();
+
+    // Product counts per seller in one grouped query
+    const productCounts = await db.orm.public.Product
+      .groupBy('sellerId')
+      .aggregate((a) => ({ count: a.count() }));
+    const countMap = new Map(productCounts.map((g) => [g.sellerId, Number(g.count)]));
+
     return {
       applications: sellers.map((s) => ({
         id: s.id,
@@ -310,10 +314,10 @@ export class AdminService {
         bannerUrl: s.bannerUrl,
         sellerStatus: s.sellerStatus,
         phone: s.phone,
-        email: s.user.email,
-        ownerName: s.user.name,
-        ownerAvatarUrl: s.user.avatarUrl,
-        registeredAt: s.user.createdAt,
+        email: (s.user as any).email,
+        ownerName: (s.user as any).name,
+        ownerAvatarUrl: (s.user as any).avatarUrl,
+        registeredAt: (s.user as any).createdAt,
         appliedAt: s.appliedAt,
         approvedAt: s.approvedAt,
         rejectedAt: s.rejectedAt,
@@ -321,51 +325,33 @@ export class AdminService {
         rejectionReason: s.rejectionReason,
         termsVersion: s.termsVersion,
         termsAcceptedAt: s.termsAcceptedAt,
-        productCount: s.user._count.products,
+        productCount: countMap.get(s.userId) ?? 0,
       })),
     };
   }
 
-  /** Full application detail for the admin review screen. done by me  */
+  /** Full application detail for the admin review screen. */
   async getSellerApplication(profileId: string) {
-    const profile = await this.prisma.sellerProfile.findUnique({
-      where: { id: profileId },
-      include: {
-        user: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-            avatarUrl: true,
-            bio: true,
-            phone: true,
-            createdAt: true,
-            _count: { select: { products: true, orders: true } },
-          },
-        },
-      },
-    });
+    const profile = await db.orm.public.SellerProfile
+      .include('user', (u: any) => u.select('id', 'name', 'email', 'avatarUrl', 'bio', 'phone', 'createdAt'))
+      .where({ id: profileId })
+      .first();
     if (!profile) throw new NotFoundException('Seller application not found');
 
-    const products = await this.prisma.product.findMany({
-      where: { sellerId: profile.userId },
-      orderBy: { createdAt: 'desc' },
-      select: {
-        id: true,
-        name: true,
-        slug: true,
-        description: true,
-        price: true,
-        productType: true,
-        status: true,
-        images: true,
-        condition: true,
-        quantity: true,
-        tags: true,
-        createdAt: true,
-        category: { select: { name: true, slug: true } },
-      },
-    });
+    const products = await db.orm.public.Product
+      .include('category', (c: any) => c.select('name', 'slug'))
+      .where({ sellerId: profile.userId })
+      .select(
+        'id', 'name', 'slug', 'description', 'price', 'productType', 'status',
+        'images', 'condition', 'quantity', 'tags', 'createdAt',
+      )
+      .orderBy((p) => p.createdAt.desc())
+      .all();
+
+    const user = profile.user as any;
+    const orderCountAgg = await db.orm.public.Order
+      .where({ userId: profile.userId })
+      .aggregate((a) => ({ total: a.count() }));
 
     return {
       id: profile.id,
@@ -379,11 +365,11 @@ export class AdminService {
       bannerUrl: profile.bannerUrl,
       sellerStatus: profile.sellerStatus,
       phone: profile.phone,
-      email: profile.user.email,
-      ownerName: profile.user.name,
-      ownerBio: profile.user.bio,
-      ownerAvatarUrl: profile.user.avatarUrl,
-      registeredAt: profile.user.createdAt,
+      email: user.email,
+      ownerName: user.name,
+      ownerBio: user.bio,
+      ownerAvatarUrl: user.avatarUrl,
+      registeredAt: user.createdAt,
       appliedAt: profile.appliedAt,
       approvedAt: profile.approvedAt,
       rejectedAt: profile.rejectedAt,
@@ -392,18 +378,18 @@ export class AdminService {
       adminNote: profile.adminNote,
       termsVersion: profile.termsVersion,
       termsAcceptedAt: profile.termsAcceptedAt,
-      productCount: profile.user._count.products,
-      orderCount: profile.user._count.orders,
+      productCount: products.length,
+      orderCount: Number(orderCountAgg.total),
       products: products.map((p) => ({ ...p, price: Number(p.price) })),
     };
   }
 
   /** Common guard for seller moderation actions. */
   private async getSellerOrThrow(profileId: string) {
-    const profile = await this.prisma.sellerProfile.findUnique({
-      where: { id: profileId },
-      include: { user: { select: { id: true, email: true, name: true } } },
-    });
+    const profile = await db.orm.public.SellerProfile
+      .include('user', (u: any) => u.select('id', 'email', 'name'))
+      .where({ id: profileId })
+      .first();
     if (!profile) throw new NotFoundException('Seller application not found');
     return profile;
   }
@@ -413,19 +399,18 @@ export class AdminService {
     if (profile.sellerStatus === 'APPROVED') {
       throw new ConflictException('Seller is already approved');
     }
-    const updated = await this.prisma.sellerProfile.update({
-      where: { id: profileId },
-      data: {
+    const updated = await db.orm.public.SellerProfile
+      .where({ id: profileId })
+      .update({
         sellerStatus: 'APPROVED',
         isVerified: true,
-        approvedAt: new Date(),
+        approvedAt: now(),
         rejectedAt: null,
         rejectionReason: null,
-      },
-    });
+      });
     // Notify (non-blocking; logged when Resend is not configured)
     this.mailer
-      .sendSellerApproved(profile.user.email, profile.storeName)
+      .sendSellerApproved((profile.user as any).email, profile.storeName)
       .catch((e) => this.logger.warn(`Approval email failed: ${e?.message ?? e}`));
     return updated;
   }
@@ -435,19 +420,18 @@ export class AdminService {
     if (profile.sellerStatus === 'APPROVED') {
       throw new BadRequestException('Suspend or block an approved seller instead of rejecting');
     }
-    const updated = await this.prisma.sellerProfile.update({
-      where: { id: profileId },
-      data: {
+    const updated = await db.orm.public.SellerProfile
+      .where({ id: profileId })
+      .update({
         sellerStatus: 'REJECTED',
         isVerified: false,
-        rejectedAt: new Date(),
+        rejectedAt: now(),
         rejectionReason: dto.reason,
         adminNote: dto.note ?? null,
-      },
-    });
+      });
     // The rejection reason goes to the seller; the admin note stays internal.
     this.mailer
-      .sendSellerRejected(profile.user.email, profile.storeName, dto.reason)
+      .sendSellerRejected((profile.user as any).email, profile.storeName, dto.reason)
       .catch((e) => this.logger.warn(`Rejection email failed: ${e?.message ?? e}`));
     return updated;
   }
@@ -457,25 +441,23 @@ export class AdminService {
     if (profile.sellerStatus === 'BLOCKED' && action === 'SUSPENDED') {
       throw new BadRequestException('Seller is already blocked');
     }
-    const updated = await this.prisma.sellerProfile.update({
-      where: { id: profileId },
-      data: {
+    const updated = await db.orm.public.SellerProfile
+      .where({ id: profileId })
+      .update({
         sellerStatus: action,
         isVerified: false,
-        suspendedAt: new Date(),
+        suspendedAt: now(),
         ...(action === 'SUSPENDED' ? { rejectionReason: dto.reason ?? null } : {}),
         ...(dto.note ? { adminNote: dto.note } : {}),
-      },
-    });
+      });
 
     // Suspension must have real teeth: pull the store's live listings.
-    await this.prisma.product.updateMany({
-      where: { sellerId: profile.userId, status: 'PUBLISHED' },
-      data: { status: 'UNPUBLISHED' },
-    });
+    await db.orm.public.Product
+      .where({ sellerId: profile.userId, status: 'PUBLISHED' })
+      .update({ status: 'UNPUBLISHED' });
 
     this.mailer
-      .sendSellerSuspended(profile.user.email, profile.storeName, dto.reason)
+      .sendSellerSuspended((profile.user as any).email, profile.storeName, dto.reason)
       .catch((e) => this.logger.warn(`Suspension email failed: ${e?.message ?? e}`));
     return updated;
   }
@@ -486,31 +468,29 @@ export class AdminService {
     if (profile.sellerStatus !== 'SUSPENDED' && profile.sellerStatus !== 'BLOCKED') {
       throw new BadRequestException('Only suspended or blocked sellers can be reinstated');
     }
-    return this.prisma.sellerProfile.update({
-      where: { id: profileId },
-      data: {
+    return db.orm.public.SellerProfile
+      .where({ id: profileId })
+      .update({
         sellerStatus: 'APPROVED',
         isVerified: true,
-        approvedAt: new Date(),
+        approvedAt: now(),
         suspendedAt: null,
         rejectionReason: null,
-      },
-    });
+      });
   }
 
   /** Product moderation with an auditable reason. */
   async moderateProduct(id: string, status: string, reason?: string) {
-    const product = await this.prisma.product.findUnique({ where: { id } });
+    const product = await db.orm.public.Product.where({ id }).first();
     if (!product) throw new NotFoundException('Product not found');
-    return this.prisma.product.update({
-      where: { id },
-      data: {
-        status: status as any,
+    const updated = await db.orm.public.Product
+      .where({ id })
+      .update({
+        status: status as never,
         moderationReason: reason ?? null,
-        moderatedAt: new Date(),
-      },
-      select: { id: true, slug: true, status: true, moderationReason: true },
-    });
+        moderatedAt: now(),
+      });
+    return { id: updated!.id, slug: updated!.slug, status: updated!.status, moderationReason: updated!.moderationReason };
   }
 
   /**
@@ -518,24 +498,28 @@ export class AdminService {
    * Used by both admin deletion and self-service account deletion.
    */
   async deleteUserCompletely(userId: string) {
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    const user = await db.orm.public.User.where({ id: userId }).first();
     if (!user) throw new NotFoundException('User not found');
     if (user.role === 'ADMIN') {
       throw new BadRequestException('Admin accounts cannot be deleted through this endpoint');
     }
 
-    // Products first — their OrderItems keep the product row alive and
-    // must be cleared before the product (and then the user) can go.
-    await this.prisma.orderItem.deleteMany({ where: { product: { sellerId: userId } } });
-    await this.prisma.product.deleteMany({ where: { sellerId: userId } });
+    await db.transaction(async (tx) => {
+      // Products first — their OrderItems keep the product row alive and
+      // must be cleared before the product (and then the user) can go.
+      await tx.orm.public.OrderItem
+        .where((i: any) => i.product.some({ sellerId: userId }))
+        .delete();
+      await tx.orm.public.Product.where({ sellerId: userId }).delete();
 
-    // The user's own orders: items cascade with the order; events too.
-    await this.prisma.order.deleteMany({ where: { userId } });
+      // The user's own orders: items cascade with the order; events too.
+      await tx.orm.public.Order.where({ userId }).delete();
 
-    // Everything else cascades via FK (reviews, seller profile, wishlist,
-    // auth tokens, seller reviews) — but cart items use sessionId, so
-    // there is nothing user-scoped to clean there.
-    await this.prisma.user.delete({ where: { id: userId } });
+      // Everything else cascades via FK (reviews, seller profile, wishlist,
+      // auth tokens, seller reviews) — but cart items use sessionId, so
+      // there is nothing user-scoped to clean there.
+      await tx.orm.public.User.where({ id: userId }).delete();
+    });
 
     return {
       message: `Account for ${user.email} deleted, including all their products and marketplace activity`,

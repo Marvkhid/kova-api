@@ -1,5 +1,5 @@
 // ============================================================
-// KOVA API — Products Module
+// KOVA API — Products Module (Prisma 8)
 // Marketplace product lifecycle:
 //   create (DRAFT) → publish (validated) → unpublish → delete
 // Server-side enforcement:
@@ -38,7 +38,8 @@ import {
   MinLength,
 } from 'class-validator';
 import { Type } from 'class-transformer';
-import { PrismaService } from '../prisma/prisma.module';
+import { db } from '../prisma/db';
+import { rawRows } from '../prisma/raw-helper';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard, Roles } from '../auth/guards/roles.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
@@ -186,7 +187,7 @@ export class ProductQueryDto {
 
 // ── Helpers ───────────────────────────────────────────────
 
-/** Prisma Decimal → JSON-safe number (Naira, 2dp max). */
+/** Decimal → JSON-safe number (Naira, 2dp max). */
 export function money(value: unknown): number {
   if (value === null || value === undefined) return 0;
   return Number(value);
@@ -197,50 +198,10 @@ function serializeProduct<T extends { price: unknown; originalPrice?: unknown }>
   return { ...p, price: money(p.price), originalPrice: p.originalPrice ? money(p.originalPrice) : null };
 }
 
-const PRODUCT_CARD_SELECT = {
-  id: true,
-  name: true,
-  slug: true,
-  price: true,
-  originalPrice: true,
-  productType: true,
-  status: true,
-  badge: true,
-  tags: true,
-  images: true,
-  inStock: true,
-  rating: true,
-  reviewCount: true,
-  buyCount: true,
-  viewCount: true,
-  createdAt: true,
-  categoryId: true,
-  category: { select: { name: true, slug: true } },
-  seller: {
-    select: {
-      id: true,
-      name: true,
-      avatarUrl: true,
-      sellerProfile: { select: { storeName: true, storeSlug: true, isVerified: true } },
-    },
-  },
-};
-
-function slugify(name: string): string {
-  return name
-    .toLowerCase()
-    .normalize('NFKD')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 80) || 'product';
-}
-
 // ── Service ───────────────────────────────────────────────
 
 @Injectable()
 export class ProductsService {
-  constructor(private prisma: PrismaService) {}
-
   /** Generate a unique slug once — never regenerated on rename. */
   private async createUniqueSlug(name: string, productId?: string): Promise<string> {
     const base = slugify(name);
@@ -249,10 +210,10 @@ export class ProductsService {
     // Loop is bounded in practice; skip our own product when updating
     // (not needed today — slugs are never regenerated).
     while (true) {
-      const clash = await this.prisma.product.findUnique({
-        where: { slug: candidate },
-        select: { id: true },
-      });
+      const clash = await db.orm.public.Product
+        .where({ slug: candidate })
+        .select('id')
+        .first();
       if (!clash || clash.id === productId) return candidate;
       candidate = `${base}-${n++}`;
     }
@@ -262,7 +223,7 @@ export class ProductsService {
   private validateForPublish(product: {
     name: string;
     description: string;
-    price: unknown; // number or Prisma Decimal
+    price: unknown; // number or string (numeric codec)
     categoryId: string | null;
     productType: 'PHYSICAL' | 'DIGITAL';
     images: string[];
@@ -289,69 +250,142 @@ export class ProductsService {
     return errors;
   }
 
-  private buildWhere(query: ProductQueryDto) {
-    const { q, category, type, badge, store, maxPrice, minPrice } = query;
-    const where: any = { status: 'PUBLISHED' };
-
-    if (q && q.trim()) {
-      where.OR = [
-        { name: { contains: q, mode: 'insensitive' } },
-        { description: { contains: q, mode: 'insensitive' } },
-        { tags: { has: q.toLowerCase() } },
-        { seller: { sellerProfile: { storeName: { contains: q, mode: 'insensitive' } } } },
-      ];
-    }
-    if (category) where.category = { slug: category.toLowerCase() };
-    if (type) where.productType = type.toUpperCase();
-    if (badge) where.badge = badge.toUpperCase();
-    if (store) where.seller = { sellerProfile: { storeSlug: store } };
-
-    const priceFilter: any = {};
-    if (minPrice !== undefined) priceFilter.gte = minPrice;
-    if (maxPrice !== undefined) priceFilter.lte = maxPrice;
-    if (Object.keys(priceFilter).length) where.price = priceFilter;
-
-    return where;
+  /**
+   * Card projection + related reads, shared by every listing query.
+   * Mirrors the old PRODUCT_CARD_SELECT exactly (category + seller +
+   * sellerProfile.isVerified included).
+   */
+  private card() {
+    return db.orm.public.Product
+      .include('category', (c) => c.select('name', 'slug'))
+      .include('seller', (s) =>
+        s
+          .select('id', 'name', 'avatarUrl')
+          .include('sellerProfile', (sp) => sp.select('storeName', 'storeSlug', 'isVerified')),
+      )
+      .select(
+        'id', 'name', 'slug', 'price', 'originalPrice', 'productType',
+        'status', 'badge', 'tags', 'images', 'inStock', 'rating',
+        'reviewCount', 'buyCount', 'viewCount', 'createdAt',
+      );
   }
 
-  private buildOrder(sort?: string) {
+  /**
+   * Text search — v8's chained API has no OR-combiner, so the free-text
+   * branch runs as its own ID pre-query (name/description ilike + tag
+   * element match + store name ilike), then the main filter narrows to
+   * those IDs. Semantics match the previous OR search.
+   */
+  private async searchTextIds(q: string): Promise<string[] | null> {
+    const term = q.trim();
+    if (!term) return null;
+    const like = `%${term}%`;
+    const tag = term.toLowerCase();
+
+    const [byName, byDescription, byTag, byStore] = await Promise.all([
+      db.orm.public.Product.where((p) => p.name.ilike(like)).select('id').all(),
+      db.orm.public.Product.where((p) => p.description.ilike(like)).select('id').all(),
+      // Scalar lists have no element-membership operator in v8 — match
+      // tags in SQL, then narrow by ID (same rows as v5's `{ has: tag }`).
+      rawRows<{ id: string }>(
+        db.raw.sql`SELECT id FROM products WHERE ${tag}::text = ANY(tags)`.returnsRow({
+          id: 'pg/text@1',
+        }),
+      ),
+      db.orm.public.SellerProfile
+        .where((sp) => sp.storeName.ilike(like))
+        .select('userId')
+        .all(),
+    ]);
+
+    const sellerIds = new Set(byStore.map((s) => s.userId));
+    const bySeller = sellerIds.size
+      ? await db.orm.public.Product
+          .where((p) => p.sellerId.in([...sellerIds]))
+          .select('id')
+          .all()
+      : [];
+
+    const ids = new Set<string>();
+    for (const row of [...byName, ...byDescription, ...byTag, ...bySeller]) {
+      ids.add(row.id);
+    }
+    return [...ids];
+  }
+
+  /** Apply the shared query filters to a collection chain. */
+  private applyFilters(
+    query: ProductQueryDto,
+    textIds: string[] | null,
+  ) {
+    let chain = this.card().where({ status: 'PUBLISHED' as const });
+
+    if (textIds) {
+      if (textIds.length === 0) return null; // no matches at all
+      chain = chain.where((p) => p.id.in(textIds));
+    }
+    if (query.category) {
+      chain = chain.where((p) => p.category.some({ slug: query.category!.toLowerCase() }));
+    }
+    if (query.type) chain = chain.where({ productType: query.type.toUpperCase() as 'PHYSICAL' | 'DIGITAL' });
+    if (query.badge) chain = chain.where({ badge: query.badge.toUpperCase() as 'NEW' | 'HOT' | 'SALE' });
+    if (query.store) {
+      chain = chain.where((p) =>
+        p.seller.some((s) => s.sellerProfile.some({ storeSlug: query.store! })),
+      );
+    }
+    if (query.minPrice !== undefined) chain = chain.where((p) => p.price.gte(String(query.minPrice) as never));
+    if (query.maxPrice !== undefined) chain = chain.where((p) => p.price.lte(String(query.maxPrice) as never));
+    return chain;
+  }
+
+  /** Order a chain by the public sort options (multi-key sorts chained). */
+  private applySort(chain: ReturnType<ProductsService['card']>, sort?: string) {
     switch (sort) {
-      case 'price-asc':  return { price: 'asc' as const };
-      case 'price-desc': return { price: 'desc' as const };
-      case 'rating':     return [{ rating: 'desc' as const }, { reviewCount: 'desc' as const }];
-      case 'popular':    return [{ buyCount: 'desc' as const }, { viewCount: 'desc' as const }];
-      case 'views':      return { viewCount: 'desc' as const };
-      case 'name':       return { name: 'asc' as const };
-      default:           return { createdAt: 'desc' as const }; // newest first
+      case 'price-asc':  return chain.orderBy((p) => p.price.asc());
+      case 'price-desc': return chain.orderBy((p) => p.price.desc());
+      case 'rating':     return chain.orderBy((p) => p.rating.desc()).orderBy((p) => p.reviewCount.desc());
+      case 'popular':    return chain.orderBy((p) => p.buyCount.desc()).orderBy((p) => p.viewCount.desc());
+      case 'views':      return chain.orderBy((p) => p.viewCount.desc());
+      case 'name':       return chain.orderBy((p) => p.name.asc());
+      default:           return chain.orderBy((p) => p.createdAt.desc()); // newest first
     }
   }
 
   async findAll(query: ProductQueryDto) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
-    const where = this.buildWhere(query);
+    const textIds = await this.searchTextIds(query.q ?? '');
+    const filtered = this.applyFilters(query, textIds);
+    if (!filtered) {
+      return { products: [], total: 0, page, limit, pages: 0 };
+    }
 
-    const [products, total] = await Promise.all([
-      this.prisma.product.findMany({
-        where,
-        orderBy: this.buildOrder(query.sort),
-        skip: (page - 1) * limit,
-        take: limit,
-        select: PRODUCT_CARD_SELECT,
-      }),
-      this.prisma.product.count({ where }),
+    const [products, totalAgg] = await Promise.all([
+      this.applySort(filtered, query.sort)
+        .offset((page - 1) * limit)
+        .limit(limit)
+        .all(),
+      filtered.aggregate((a) => ({ total: a.count() })),
     ]);
+    const total = Number(totalAgg.total);
 
-    return { products: products.map(serializeProduct), total, page, limit, pages: Math.ceil(total / limit) };
+    return {
+      products: products.map(serializeProduct),
+      total,
+      page,
+      limit,
+      pages: Math.ceil(total / limit),
+    };
   }
 
   async getFeatured(limit = 8) {
-    const products = await this.prisma.product.findMany({
-      where: { status: 'PUBLISHED' },
-      orderBy: [{ buyCount: 'desc' }, { viewCount: 'desc' }],
-      take: limit,
-      select: PRODUCT_CARD_SELECT,
-    });
+    const products = await this.card()
+      .where({ status: 'PUBLISHED' })
+      .orderBy((p) => p.buyCount.desc())
+      .orderBy((p) => p.viewCount.desc())
+      .limit(limit)
+      .all();
     return products.map(serializeProduct);
   }
 
@@ -362,7 +396,10 @@ export class ProductsService {
    * fabricating anything: every candidate is a real published row.
    */
   async getDiscovery(limit = 20) {
-    const total = await this.prisma.product.count({ where: { status: 'PUBLISHED' } });
+    const totalAgg = await db.orm.public.Product
+      .where({ status: 'PUBLISHED' })
+      .aggregate((a) => ({ total: a.count() }));
+    const total = Number(totalAgg.total);
     if (total === 0) return [];
 
     // Day-changing offset + deterministic jitter rotates the pool daily
@@ -372,21 +409,21 @@ export class ProductsService {
     const offset = total > limit * 3 ? (jitter * (total - limit * 3)) / 97 : 0;
 
     const [a, b] = await Promise.all([
-      this.prisma.product.findMany({
-        where: { status: 'PUBLISHED' },
-        orderBy: { createdAt: 'desc' },
-        skip: Math.floor(offset),
-        take: limit,
-        select: PRODUCT_CARD_SELECT,
-      }),
+      this.card()
+        .where({ status: 'PUBLISHED' })
+        .orderBy((p) => p.createdAt.desc())
+        .offset(Math.floor(offset))
+        .limit(limit)
+        .all(),
       // Guarantee multi-seller variety: top-rated picks appended from a
       // different sort order so a sparse day still shows diverse sellers.
-      this.prisma.product.findMany({
-        where: { status: 'PUBLISHED', rating: { gte: 4 } },
-        orderBy: [{ reviewCount: 'desc' }, { buyCount: 'desc' }],
-        take: Math.ceil(limit / 2),
-        select: PRODUCT_CARD_SELECT,
-      }),
+      this.card()
+        .where({ status: 'PUBLISHED' })
+        .where((p) => p.rating.gte(4))
+        .orderBy((p) => p.reviewCount.desc())
+        .orderBy((p) => p.buyCount.desc())
+        .limit(Math.ceil(limit / 2))
+        .all(),
     ]);
 
     // Merge, de-dupe, then balance so one seller can't dominate the grid
@@ -399,9 +436,11 @@ export class ProductsService {
     const bySeller = new Map<string, number>();
     const balanced: typeof merged = [];
     for (const p of merged) {
-      const n = bySeller.get(p.seller.id) ?? 0;
+      const sellerId = p.seller?.id;
+      if (!sellerId) continue;
+      const n = bySeller.get(sellerId) ?? 0;
       if (n >= Math.max(2, Math.ceil(limit / 5))) continue;
-      bySeller.set(p.seller.id, n + 1);
+      bySeller.set(sellerId, n + 1);
       balanced.push(p);
     }
     return balanced.slice(0, limit).map(serializeProduct);
@@ -409,74 +448,63 @@ export class ProductsService {
 
   /** New Arrivals — newest published listings first. */
   async getNew(limit = 12) {
-    const products = await this.prisma.product.findMany({
-      where: { status: 'PUBLISHED' },
-      orderBy: { createdAt: 'desc' },
-      take: limit,
-      select: PRODUCT_CARD_SELECT,
-    });
+    const products = await this.card()
+      .where({ status: 'PUBLISHED' })
+      .orderBy((p) => p.createdAt.desc())
+      .limit(limit)
+      .all();
     return products.map(serializeProduct);
   }
 
   /** Public product page by slug — the canonical URL QR codes point to. */
   async findBySlug(slug: string) {
-    const product = await this.prisma.product.findUnique({
-      where: { slug },
-      select: {
-        ...PRODUCT_CARD_SELECT,
-        description: true,
-        updatedAt: true,
-        reviews: {
-          include: {
-            user: { select: { id: true, name: true, avatarUrl: true } },
-          },
-          orderBy: { createdAt: 'desc' },
-          take: 10,
-        },
-      },
-    });
+    const product = await this.detailChain().where({ slug }).first();
     if (!product || product.status !== 'PUBLISHED') {
       throw new NotFoundException('Product not found');
     }
 
     // Count the view (fire-and-forget: never block the page on it)
-    this.prisma.product
-      .update({ where: { id: product.id }, data: { viewCount: { increment: 1 } } })
+    db.orm.public.Product
+      .where({ id: product.id })
+      .update({ viewCount: product.viewCount + 1 })
       .catch(() => undefined);
 
     return serializeProduct(product);
   }
 
+  /** Card projection + description + latest reviews. */
+  private detailChain() {
+    return this.card()
+      .select(
+        'id', 'name', 'slug', 'price', 'originalPrice', 'productType',
+        'status', 'badge', 'tags', 'images', 'inStock', 'rating',
+        'reviewCount', 'buyCount', 'viewCount', 'createdAt',
+        'description', 'updatedAt',
+      )
+      .include('reviews', (r) =>
+        r
+          .include('user', (u) => u.select('id', 'name', 'avatarUrl'))
+          .select('id', 'rating', 'title', 'comment', 'createdAt', 'verifiedPurchase')
+          .orderBy((rev) => rev.createdAt.desc())
+          .limit(10),
+      );
+  }
+
   async findOne(id: string) {
-    const product = await this.prisma.product.findUnique({
-      where: { id },
-      select: {
-        ...PRODUCT_CARD_SELECT,
-        description: true,
-        reviews: {
-          include: {
-            user: { select: { id: true, name: true, avatarUrl: true } },
-          },
-          orderBy: { createdAt: 'desc' },
-          take: 10,
-        },
-      },
-    });
+    const product = await this.detailChain().where({ id }).first();
     if (!product) throw new NotFoundException('Product not found');
     return serializeProduct(product);
   }
 
   async getRelated(productId: string, categoryId: string | null, limit = 4) {
-    const products = await this.prisma.product.findMany({
-      where: {
-        status: 'PUBLISHED',
-        id: { not: productId },
-        ...(categoryId ? { categoryId } : {}),
-      },
-      orderBy: { createdAt: 'desc' },
-      take: limit,
-      select: PRODUCT_CARD_SELECT,
-    });
+    let chain = this.card()
+      .where({ status: 'PUBLISHED' })
+      .where((p) => p.id.neq(productId));
+    if (categoryId) chain = chain.where({ categoryId });
+    const products = await chain
+      .orderBy((p) => p.createdAt.desc())
+      .limit(limit)
+      .all();
     return products.map(serializeProduct);
   }
 
@@ -485,15 +513,16 @@ export class ProductsService {
       throw new BadRequestException('Invalid category');
     }
 
-    const category = await this.prisma.category.findUnique({
-      where: { slug: dto.categorySlug.toLowerCase() },
-    });
+    const category = await db.orm.public.Category
+      .where({ slug: dto.categorySlug.toLowerCase() })
+      .select('id')
+      .first();
     if (!category) throw new BadRequestException('Unknown category');
 
     // Sellers must have completed onboarding
-    const profile = await this.prisma.sellerProfile.findUnique({
-      where: { userId: user.id },
-    });
+    const profile = await db.orm.public.SellerProfile
+      .where({ userId: user.id })
+      .first();
     if (!profile && user.role !== 'ADMIN') {
       throw new ForbiddenException('Create your seller profile first');
     }
@@ -503,8 +532,8 @@ export class ProductsService {
 
     // Governance: seller status decides whether publish is even possible.
     // Enforced HERE on the server — never by the UI alone.
-    let publishStatus: 'PUBLISHED' | 'PENDING_REVIEW' = 'PUBLISHED';
-    if (wantsPublish && user.role !== 'ADMIN') {
+    // (An ADMIN with no seller profile skips these checks entirely.)
+    if (wantsPublish && user.role !== 'ADMIN' && profile) {
       if (profile.sellerStatus === 'PENDING') {
         throw new ForbiddenException(
           'Your seller application is still under review — products can be saved as drafts, but not published yet',
@@ -536,31 +565,31 @@ export class ProductsService {
 
     const slug = await this.createUniqueSlug(dto.name);
 
-    return this.prisma.product.create({
-      data: {
+    const created = await db.orm.public.Product
+      .include('category', (c) => c.select('name', 'slug'))
+      .create({
         name: dto.name,
         slug,
         description: dto.description,
-        price: dto.price,
-        originalPrice: dto.originalPrice ?? null,
+        price: dto.price as never,
+        originalPrice: (dto.originalPrice ?? null) as never,
         productType: dto.productType,
         condition: dto.condition ?? null,
         quantity: dto.quantity ?? null,
         digitalInfo: dto.digitalInfo ?? null,
-        status: wantsPublish ? publishStatus : 'DRAFT',
+        status: wantsPublish ? 'PUBLISHED' : 'DRAFT',
         tags: (dto.tags ?? []).map((t) => t.toLowerCase().trim()).filter(Boolean),
         images,
         inStock: dto.inStock ?? true,
         categoryId: category.id,
         sellerId: user.id,
-      },
-      select: { id: true, slug: true, status: true, name: true },
-    });
+      });
+    return { id: created.id, slug: created.slug, status: created.status, name: created.name };
   }
 
   /** Load a product the requester is allowed to mutate. */
   private async getOwnedProduct(id: string, user: any) {
-    const product = await this.prisma.product.findUnique({ where: { id } });
+    const product = await db.orm.public.Product.where({ id }).first();
     if (!product) throw new NotFoundException('Product not found');
     if (product.sellerId !== user.id && user.role !== 'ADMIN') {
       // Ownership enforced here — the server decides, never the client.
@@ -588,9 +617,10 @@ export class ProductsService {
     if (dto.inStock !== undefined) data.inStock = dto.inStock;
 
     if (dto.categorySlug !== undefined) {
-      const category = await this.prisma.category.findUnique({
-        where: { slug: dto.categorySlug.toLowerCase() },
-      });
+      const category = await db.orm.public.Category
+        .where({ slug: dto.categorySlug.toLowerCase() })
+        .select('id')
+        .first();
       if (!category) throw new BadRequestException('Unknown category');
       data.categoryId = category.id;
     }
@@ -609,24 +639,25 @@ export class ProductsService {
       if (errors.length) throw new BadRequestException({ message: errors, statusCode: 400 });
     }
 
-    return this.prisma.product.update({
-      where: { id },
-      data,
-      select: { id: true, slug: true, status: true, name: true },
-    });
+    const updated = await db.orm.public.Product
+      .where({ id })
+      .update(data);
+    if (!updated) throw new NotFoundException('Product not found');
+    return { id: updated!.id, slug: updated!.slug, status: updated!.status, name: updated!.name };
   }
 
   async publish(id: string, user: any) {
     const product = await this.getOwnedProduct(id, user);
-    const errors = this.validateForPublish(product);
+    const errors = this.validateForPublish({
+      ...product,
+      images: product.images ? [...product.images] : [],
+    });
     if (errors.length) throw new BadRequestException({ message: errors, statusCode: 400 });
 
     // Governance: seller status gates publishing server-side.
     const profile = user.role === 'ADMIN'
       ? null
-      : await this.prisma.sellerProfile.findUnique({
-          where: { userId: user.id },
-        });
+      : await db.orm.public.SellerProfile.where({ userId: user.id }).first();
     if (user.role !== 'ADMIN') {
       if (!profile || profile.sellerStatus === 'PENDING') {
         throw new ForbiddenException(
@@ -652,36 +683,35 @@ export class ProductsService {
         ? 'PUBLISHED'
         : 'PENDING_REVIEW';
 
-    return this.prisma.product.update({
-      where: { id },
-      data: { status: nextStatus, moderationReason: null, moderatedAt: null },
-      select: { id: true, slug: true, status: true },
-    });
+    const updated = await db.orm.public.Product
+      .where({ id })
+      .update({ status: nextStatus, moderationReason: null, moderatedAt: null });
+    if (!updated) throw new NotFoundException('Product not found');
+    return { id: updated!.id, slug: updated!.slug, status: updated!.status };
   }
 
   async unpublish(id: string, user: any) {
     await this.getOwnedProduct(id, user);
-    return this.prisma.product.update({
-      where: { id },
-      data: { status: 'UNPUBLISHED' },
-      select: { id: true, slug: true, status: true },
-    });
+    const updated = await db.orm.public.Product
+      .where({ id })
+      .update({ status: 'UNPUBLISHED' });
+    if (!updated) throw new NotFoundException('Product not found');
+    return { id: updated!.id, slug: updated!.slug, status: updated!.status };
   }
 
   async remove(id: string, user: any) {
     await this.getOwnedProduct(id, user);
-    await this.prisma.product.delete({ where: { id } });
+    await db.orm.public.Product.where({ id }).delete();
     return { message: 'Product deleted' };
   }
 
   // ── Seller endpoints ─────────────────────────────────────
 
   async getSellerProducts(sellerId: string) {
-    const products = await this.prisma.product.findMany({
-      where: { sellerId },
-      orderBy: { createdAt: 'desc' },
-      select: PRODUCT_CARD_SELECT,
-    });
+    const products = await this.card()
+      .where({ sellerId })
+      .orderBy((p) => p.createdAt.desc())
+      .all();
     const serialized = products.map(serializeProduct);
 
     const counts = {
@@ -698,6 +728,15 @@ export class ProductsService {
 
     return { products: serialized, counts };
   }
+}
+
+function slugify(name: string): string {
+  return name
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'product';
 }
 
 // ── Controller ────────────────────────────────────────────

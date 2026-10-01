@@ -1,5 +1,5 @@
 // ============================================================
-// KOVA API — Local Email + Password Auth Service
+// KOVA API — Local Email + Password Auth Service (Prisma 8)
 // A first-party alternative/parallel path to Clerk sign-in.
 //   • register: creates a real user (bcrypt-hashed password),
 //     optionally with their own seller shop (unique slug) in
@@ -20,7 +20,7 @@ import {
 import { JwtService } from '@nestjs/jwt';
 import { IsEmail, IsOptional, IsString, MinLength, MaxLength, Matches } from 'class-validator';
 import * as bcrypt from 'bcryptjs';
-import { PrismaService } from '../prisma/prisma.module';
+import { db, now } from '../prisma/db';
 import { AuthTokensService } from './auth-tokens.service';
 import { MailerService } from './mailer.service';
 
@@ -74,7 +74,6 @@ const BCRYPT_ROUNDS = 10;
 @Injectable()
 export class LocalAuthService {
   constructor(
-    private prisma: PrismaService,
     private jwt: JwtService,
     private tokens: AuthTokensService,
     private mailer: MailerService,
@@ -95,10 +94,10 @@ export class LocalAuthService {
 
     for (let i = 0; i < 50; i++) {
       const candidate = i === 0 ? base : `${base}-${i + 1}`;
-      const taken = await this.prisma.sellerProfile.findUnique({
-        where: { storeSlug: candidate },
-        select: { id: true },
-      });
+      const taken = await db.orm.public.SellerProfile
+        .where({ storeSlug: candidate })
+        .select('id')
+        .first();
       if (!taken) return candidate;
     }
     // Practically unreachable; last resort with random suffix.
@@ -113,7 +112,7 @@ export class LocalAuthService {
       throw new ConflictException('Store name is required for seller accounts');
     }
 
-    const existing = await this.prisma.user.findUnique({ where: { email } });
+    const existing = await db.orm.public.User.where({ email }).first();
     if (existing) {
       throw new ConflictException(
         'An account with this email already exists — try logging in instead',
@@ -124,26 +123,22 @@ export class LocalAuthService {
     const storeName = role === 'SELLER' ? dto.storeName!.trim() : null;
 
     // User + shop created atomically.
-    const user = await this.prisma.$transaction(async (tx) => {
-      const created = await tx.user.create({
-        data: {
-          clerkId: `local:${email}`,
-          email,
-          passwordHash,
-          name: dto.name.trim(),
-          role,
-        },
+    const user = await db.transaction(async (tx) => {
+      const created = await tx.orm.public.User.create({
+        clerkId: `local:${email}`,
+        email,
+        passwordHash,
+        name: dto.name.trim(),
+        role,
       });
 
       if (role === 'SELLER' && storeName) {
         const storeSlug = await this.uniqueStoreSlug(storeName);
-        await tx.sellerProfile.create({
-          data: {
-            userId: created.id,
-            storeName,
-            storeSlug,
-            description: dto.storeDescription?.trim() || null,
-          },
+        await tx.orm.public.SellerProfile.create({
+          userId: created.id,
+          storeName,
+          storeSlug,
+          description: dto.storeDescription?.trim() || null,
         });
       }
 
@@ -155,7 +150,7 @@ export class LocalAuthService {
 
   async login(dto: LoginDto) {
     const email = dto.email.trim().toLowerCase();
-    const user = await this.prisma.user.findUnique({ where: { email } });
+    const user = await db.orm.public.User.where({ email }).first();
 
     if (!user || !user.passwordHash) {
       // Same message for both cases — do not leak which emails exist.
@@ -174,15 +169,14 @@ export class LocalAuthService {
 
   async verifyEmail(token: string) {
     const { userId } = await this.tokens.consume(token, 'EMAIL_VERIFY');
-    const user = await this.prisma.user.update({
-      where: { id: userId },
-      data: { emailVerifiedAt: new Date() },
-    });
-    return { verified: true, email: user.email };
+    const user = await db.orm.public.User
+      .where({ id: userId })
+      .update({ emailVerifiedAt: now() });
+    return { verified: true, email: user!.email };
   }
 
   async resendVerification(userId: string) {
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    const user = await db.orm.public.User.where({ id: userId }).first();
     if (!user) throw new UnauthorizedException('Account not found');
     if (user.emailVerifiedAt) {
       return { sent: false, message: 'Email is already verified' };
@@ -197,7 +191,7 @@ export class LocalAuthService {
   /** Always returns { sent: true } — never reveals which emails exist. */
   async forgotPassword(email: string) {
     const normalized = email.trim().toLowerCase();
-    const user = await this.prisma.user.findUnique({ where: { email: normalized } });
+    const user = await db.orm.public.User.where({ email: normalized }).first();
     if (!user || !user.passwordHash) return { sent: true };
     const token = await this.tokens.issue(user.id, 'PASSWORD_RESET');
     const delivered = await this.mailer.sendPasswordReset(user.email, token);
@@ -207,7 +201,7 @@ export class LocalAuthService {
   async resetPassword(token: string, password: string) {
     const { userId } = await this.tokens.consume(token, 'PASSWORD_RESET');
     const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    await this.prisma.user.update({ where: { id: userId }, data: { passwordHash } });
+    await db.orm.public.User.where({ id: userId }).update({ passwordHash });
     return { reset: true };
   }
 
@@ -227,10 +221,10 @@ export class LocalAuthService {
     email: string;
     role: string;
   }) {
-    const full = await this.prisma.user.findUnique({
-      where: { id: user.id },
-      include: { sellerProfile: true },
-    });
+    const full = await db.orm.public.User
+      .include('sellerProfile')
+      .where({ id: user.id })
+      .first();
 
     const token = await this.jwt.signAsync({
       sub: user.id,

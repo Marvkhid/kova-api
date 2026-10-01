@@ -2,21 +2,21 @@
 // KOVA — apply per-product images to the LIVE database
 // Maps every Product row to its base SeedItem via the exact
 // slug→baseName mapping from the expansion chain (the same
-// specs seed.ts used to create the rows), looks up the verified
+// specs seed.cts used to create the rows), looks up the verified
 // image set in scripts/products-manifest.json, and updates ONLY
 // the images column — ids, slugs, sellers, prices, statuses
-// untouched. Run: npx ts-node scripts/apply-product-images.ts [--dry]
+// untouched. Run: node -r ts-node/register/transpile-only scripts/apply-product-images.cts [--dry]
 // ============================================================
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { PrismaClient } from '@prisma/client';
+import { db } from '../src/prisma/db';
+import 'dotenv/config';
 
-const prisma = new PrismaClient();
 const MANIFEST_PATH = path.resolve(__dirname, 'products-manifest.json');
 const DRY = process.argv.includes('--dry');
 
-// Mirrors the expansion chain in prisma/seed.ts so slug→base mapping
+// Mirrors the expansion chain in prisma/seed.cts so slug→base mapping
 // is derived exactly the way the rows were created.
 import { expandCatalog } from '../prisma/catalog';
 import { ITEMS } from '../prisma/seed-data';
@@ -41,9 +41,9 @@ async function main() {
   const baseBySlug = new Map<string, string>();
   for (const s of specs) baseBySlug.set(s.slug, s.item.name);
 
-  const rows = await prisma.product.findMany({
-    select: { id: true, slug: true, images: true },
-  });
+  const rows = await db.orm.public.Product
+    .select('id', 'slug', 'images')
+    .all();
   console.log('product rows:', rows.length);
 
   const updates: { id: string; slug: string; images: string[]; from: string }[] = [];
@@ -71,10 +71,7 @@ async function main() {
 
   let n = 0;
   for (const u of updates) {
-    await prisma.product.update({
-      where: { id: u.id },
-      data: { images: u.images },
-    });
+    await db.orm.public.Product.where({ id: u.id }).update({ images: u.images });
     n++;
     if (n % 200 === 0) console.log(`  updated ${n}/${updates.length}`);
   }
@@ -86,4 +83,4 @@ main()
     console.error('FATAL', e);
     process.exit(1);
   })
-  .finally(() => prisma.$disconnect());
+  .then(() => db.close());

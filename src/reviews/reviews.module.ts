@@ -1,5 +1,5 @@
 // ============================================================
-// KOVA API — Reviews Module (v2)
+// KOVA API — Reviews Module (v2, Prisma 8)
 // Product reviews + seller reputation reviews.
 //   • verifiedPurchase is computed SERVER-SIDE from real PAID
 //     OrderItems — the client can never assert it.
@@ -40,8 +40,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { Type } from 'class-transformer';
-import { PrismaService } from '../prisma/prisma.module';
-import type { Prisma, ReviewStatus } from '@prisma/client';
+import { db } from '../prisma/db';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard, Roles } from '../auth/guards/roles.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
@@ -55,34 +54,26 @@ function toNum(value: unknown): number {
 }
 
 /** Recompute a product's rating aggregate from its VISIBLE reviews. */
-async function recomputeProductRating(prisma: PrismaService, productId: string) {
-  const agg = await prisma.review.aggregate({
-    where: { productId, status: 'VISIBLE' },
-    _avg: { rating: true },
-    _count: true,
-  });
-  await prisma.product.update({
-    where: { id: productId },
-    data: {
-      rating: agg._avg.rating ? Math.round(agg._avg.rating * 10) / 10 : 0,
-      reviewCount: agg._count,
-    },
+async function recomputeProductRating(productId: string) {
+  const agg = await db.orm.public.Review
+    .where({ productId, status: 'VISIBLE' })
+    .aggregate((a) => ({ avgRating: a.avg('rating'), total: a.count() }));
+  await db.orm.public.Product.where({ id: productId }).update({
+    rating: agg.avgRating ? Math.round(Number(agg.avgRating) * 10) / 10 : 0,
+    reviewCount: Number(agg.total),
   });
 }
 
 /** Server-side verified-purchase check — the ONLY source of truth. */
 async function isVerifiedPurchase(
-  prisma: PrismaService,
   userId: string,
   productId: string,
 ): Promise<boolean> {
-  const paidItem = await prisma.orderItem.findFirst({
-    where: {
-      productId,
-      order: { userId, paymentStatus: 'PAID' },
-    },
-    select: { id: true },
-  });
+  const paidItem = await db.orm.public.OrderItem
+    .where({ productId })
+    .where((item) => item.order.some({ userId, paymentStatus: 'PAID' }))
+    .select('id')
+    .first();
   return paidItem !== null;
 }
 
@@ -134,38 +125,33 @@ export class ReviewListQueryDto {
 
 @Injectable()
 export class ReviewsService {
-  constructor(private prisma: PrismaService) {}
-
   /** Public review list + honest summary for a product page. */
   async getProductReviews(productId: string, page = 1, limit = 10) {
-    const product = await this.prisma.product.findUnique({
-      where: { id: productId },
-      select: { id: true, slug: true, name: true },
-    });
+    const product = await db.orm.public.Product
+      .where({ id: productId })
+      .select('id', 'slug', 'name')
+      .first();
     if (!product) throw new NotFoundException('Product not found');
 
-    const where: Prisma.ReviewWhereInput = { productId, status: 'VISIBLE' };
-
     const [reviews, total, distribution] = await Promise.all([
-      this.prisma.review.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip: (page - 1) * limit,
-        take: limit,
-        include: {
-          user: { select: { id: true, name: true, avatarUrl: true } },
-        },
-      }),
-      this.prisma.review.count({ where }),
-      this.prisma.review.groupBy({
-        by: ['rating'],
-        where,
-        _count: true,
-      }),
+      db.orm.public.Review
+        .where({ productId, status: 'VISIBLE' })
+        .include('user', (user) => user.select('id', 'name', 'avatarUrl'))
+        .orderBy((r) => r.createdAt.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+        .all(),
+      db.orm.public.Review.where({ productId, status: 'VISIBLE' })
+        .aggregate((a) => ({ total: a.count() }))
+        .then((r) => Number(r.total)),
+      db.orm.public.Review
+        .where({ productId, status: 'VISIBLE' })
+        .groupBy('rating')
+        .aggregate((a) => ({ count: a.count() })),
     ]);
 
     const buckets: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
-    for (const row of distribution) buckets[row.rating] = row._count;
+    for (const row of distribution) buckets[row.rating as number] = Number(row.count);
 
     return {
       product: { id: product.id, slug: product.slug, name: product.name },
@@ -182,11 +168,11 @@ export class ReviewsService {
 
   private summaryAverage(
     total: number,
-    distribution: { rating: number; _count: number }[],
+    distribution: { rating: unknown; count: unknown }[],
   ): number {
     if (total === 0) return 0;
-    const weighted = distribution.reduce((s, r) => s + r.rating * r._count, 0);
-    const sum = distribution.reduce((s, r) => s + r._count, 0);
+    const weighted = distribution.reduce((s, r) => s + Number(r.rating) * Number(r.count), 0);
+    const sum = distribution.reduce((s, r) => s + Number(r.count), 0);
     return sum > 0 ? Math.round((weighted / sum) * 10) / 10 : 0;
   }
 
@@ -214,88 +200,76 @@ export class ReviewsService {
    *   • optional seller rating only recorded on verified purchases
    */
   async submitReview(userId: string, dto: SubmitReviewDto) {
-    const product = await this.prisma.product.findUnique({
-      where: { id: dto.productId },
-      select: { id: true, sellerId: true, status: true },
-    });
+    const product = await db.orm.public.Product
+      .where({ id: dto.productId })
+      .select('id', 'sellerId', 'status')
+      .first();
     if (!product) throw new NotFoundException('Product not found');
 
     if (product.sellerId === userId) {
       throw new BadRequestException('You cannot review your own product');
     }
 
-    const verified = await isVerifiedPurchase(this.prisma, userId, dto.productId);
+    const verified = await isVerifiedPurchase(userId, dto.productId);
 
-    const existing = await this.prisma.review.findUnique({
-      where: { userId_productId: { userId, productId: dto.productId } },
-    });
+    const existing = await db.orm.public.Review
+      .where({ userId, productId: dto.productId })
+      .first();
     if (existing) {
       throw new BadRequestException(
         'You already reviewed this product — edit your review instead',
       );
     }
 
-    const [review] = await this.prisma.$transaction([
-      this.prisma.review.create({
-        data: {
+    const review = await db.transaction(async (tx) => {
+      const created = await tx.orm.public.Review
+        .include('user', (user) => user.select('id', 'name', 'avatarUrl'))
+        .create({
           userId,
           productId: dto.productId,
           rating: dto.rating,
           title: dto.title?.trim() || null,
           comment: dto.comment?.trim() || null,
           verifiedPurchase: verified,
-        },
-        include: { user: { select: { id: true, name: true, avatarUrl: true } } },
-      }),
-      // Seller reputation rides along only on verified purchases
-      ...(dto.sellerRating && verified
-        ? [
-            this.prisma.sellerReview.upsert({
-              where: {
-                sellerUserId_authorId: {
-                  sellerUserId: product.sellerId,
-                  authorId: userId,
-                },
-              },
-              create: {
-                sellerUserId: product.sellerId,
-                authorId: userId,
-                rating: dto.sellerRating.rating,
-                communication: dto.sellerRating.communication ?? null,
-                productAccuracy: dto.sellerRating.productAccuracy ?? null,
-                packaging: dto.sellerRating.packaging ?? null,
-                deliveryExperience: dto.sellerRating.deliveryExperience ?? null,
-                comment: dto.sellerRating.comment?.trim() || null,
-              },
-              update: {
-                rating: dto.sellerRating.rating,
-                communication: dto.sellerRating.communication ?? null,
-                productAccuracy: dto.sellerRating.productAccuracy ?? null,
-                packaging: dto.sellerRating.packaging ?? null,
-                deliveryExperience: dto.sellerRating.deliveryExperience ?? null,
-                comment: dto.sellerRating.comment?.trim() || null,
-              },
-            }),
-          ]
-        : []),
-      // Keep denormalized aggregates true to the rows
-      this.prisma.product.update({
-        where: { id: product.id },
-        data: { buyCount: { increment: 0 } }, // no-op keeps txn shape explicit
-      }),
-    ]);
+        });
 
-    await recomputeProductRating(this.prisma, dto.productId);
+      // Seller reputation rides along only on verified purchases
+      if (dto.sellerRating && verified) {
+        const existingSellerReview = await tx.orm.public.SellerReview
+          .where({ sellerUserId: product.sellerId, authorId: userId })
+          .first();
+        const sellerRatingFields = {
+          rating: dto.sellerRating.rating,
+          communication: dto.sellerRating.communication ?? null,
+          productAccuracy: dto.sellerRating.productAccuracy ?? null,
+          packaging: dto.sellerRating.packaging ?? null,
+          deliveryExperience: dto.sellerRating.deliveryExperience ?? null,
+          comment: dto.sellerRating.comment?.trim() || null,
+        };
+        if (existingSellerReview) {
+          await tx.orm.public.SellerReview
+            .where({ id: existingSellerReview.id })
+            .update(sellerRatingFields);
+        } else {
+          await tx.orm.public.SellerReview
+            .create({ sellerUserId: product.sellerId, authorId: userId, ...sellerRatingFields });
+        }
+      }
+
+      return created;
+    });
+
+    await recomputeProductRating(dto.productId);
     return this.serializeReview(review);
   }
 
   /** My review for a product (drives the edit form on the PDP). */
   async getMyReview(userId: string, productId: string) {
-    const review = await this.prisma.review.findUnique({
-      where: { userId_productId: { userId, productId } },
-    });
+    const review = await db.orm.public.Review
+      .where({ userId, productId })
+      .first();
     // Also tell the buyer whether they're eligible (purchased + paid)
-    const verified = await isVerifiedPurchase(this.prisma, userId, productId);
+    const verified = await isVerifiedPurchase(userId, productId);
     return {
       review: review ? this.serializeReview(review) : null,
       verifiedPurchase: verified,
@@ -304,15 +278,11 @@ export class ReviewsService {
 
   /** My reviews across the marketplace. */
   async getMyReviews(userId: string) {
-    const reviews = await this.prisma.review.findMany({
-      where: { userId },
-      orderBy: { createdAt: 'desc' },
-      include: {
-        product: {
-          select: { id: true, name: true, slug: true, images: true, price: true },
-        },
-      },
-    });
+    const reviews = await db.orm.public.Review
+      .where({ userId })
+      .include('product', (product) => product.select('id', 'name', 'slug', 'images', 'price'))
+      .orderBy((r) => r.createdAt.desc())
+      .all();
     return reviews.map((r) => ({
       ...this.serializeReview(r),
       product: r.product
@@ -323,35 +293,34 @@ export class ReviewsService {
 
   /** Author edit — aggregates recomputed, moderation status untouched. */
   async updateReview(reviewId: string, userId: string, dto: UpdateReviewDto) {
-    const review = await this.prisma.review.findUnique({ where: { id: reviewId } });
+    const review = await db.orm.public.Review.where({ id: reviewId }).first();
     if (!review) throw new NotFoundException('Review not found');
     if (review.userId !== userId) {
       throw new ForbiddenException('You can only edit your own review');
     }
 
-    const updated = await this.prisma.review.update({
-      where: { id: reviewId },
-      data: {
+    const updated = await db.orm.public.Review
+      .include('user', (user) => user.select('id', 'name', 'avatarUrl'))
+      .where({ id: reviewId })
+      .update({
         ...(dto.rating !== undefined ? { rating: dto.rating } : {}),
         ...(dto.title !== undefined ? { title: dto.title.trim() || null } : {}),
         ...(dto.comment !== undefined ? { comment: dto.comment.trim() || null } : {}),
-      },
-      include: { user: { select: { id: true, name: true, avatarUrl: true } } },
-    });
+      });
 
-    await recomputeProductRating(this.prisma, review.productId);
+    await recomputeProductRating(review.productId);
     return this.serializeReview(updated);
   }
 
   /** Author delete — aggregates recomputed. */
   async deleteReview(reviewId: string, userId: string, isAdmin: boolean) {
-    const review = await this.prisma.review.findUnique({ where: { id: reviewId } });
+    const review = await db.orm.public.Review.where({ id: reviewId }).first();
     if (!review) throw new NotFoundException('Review not found');
     if (review.userId !== userId && !isAdmin) {
       throw new ForbiddenException('You can only delete your own review');
     }
-    await this.prisma.review.delete({ where: { id: reviewId } });
-    await recomputeProductRating(this.prisma, review.productId);
+    await db.orm.public.Review.where({ id: reviewId }).delete();
+    await recomputeProductRating(review.productId);
     return { message: 'Review deleted' };
   }
 
@@ -359,28 +328,36 @@ export class ReviewsService {
 
   /** Public seller-review list + aggregate for the store page. */
   async getSellerReviews(sellerUserId: string, page = 1, limit = 10) {
-    const seller = await this.prisma.user.findUnique({
-      where: { id: sellerUserId },
-      select: { id: true, name: true, sellerProfile: { select: { storeName: true, storeSlug: true } } },
-    });
+    const seller = await db.orm.public.User
+      .where({ id: sellerUserId })
+      .include('sellerProfile', (profile) => profile.select('storeName', 'storeSlug'))
+      .select('id', 'name')
+      .first();
     if (!seller) throw new NotFoundException('Seller not found');
 
-    const where: Prisma.SellerReviewWhereInput = { sellerUserId, status: 'VISIBLE' };
-
     const [reviews, total, agg] = await Promise.all([
-      this.prisma.sellerReview.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip: (page - 1) * limit,
-        take: limit,
-        include: { author: { select: { id: true, name: true, avatarUrl: true } } },
-      }),
-      this.prisma.sellerReview.count({ where }),
-      this.prisma.sellerReview.aggregate({
-        where,
-        _avg: { rating: true, communication: true, productAccuracy: true, packaging: true, deliveryExperience: true },
-      }),
+      db.orm.public.SellerReview
+        .where({ sellerUserId, status: 'VISIBLE' })
+        .include('author', (author) => author.select('id', 'name', 'avatarUrl'))
+        .orderBy((r) => r.createdAt.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+        .all(),
+      db.orm.public.SellerReview.where({ sellerUserId, status: 'VISIBLE' })
+        .aggregate((a) => ({ total: a.count() }))
+        .then((r) => Number(r.total)),
+      db.orm.public.SellerReview
+        .where({ sellerUserId, status: 'VISIBLE' })
+        .aggregate((a) => ({
+          avgRating: a.avg('rating'),
+          avgCommunication: a.avg('communication'),
+          avgProductAccuracy: a.avg('productAccuracy'),
+          avgPackaging: a.avg('packaging'),
+          avgDeliveryExperience: a.avg('deliveryExperience'),
+        })),
     ]);
+
+    const round1 = (v: unknown) => (v ? Math.round(Number(v) * 10) / 10 : null);
 
     return {
       seller: { id: seller.id, name: seller.name, store: seller.sellerProfile },
@@ -398,13 +375,13 @@ export class ReviewsService {
           : null,
       })),
       summary: {
-        average: agg._avg.rating ? Math.round(agg._avg.rating * 10) / 10 : 0,
+        average: agg.avgRating ? Math.round(Number(agg.avgRating) * 10) / 10 : 0,
         total,
         dimensions: {
-          communication: agg._avg.communication ? Math.round(agg._avg.communication * 10) / 10 : null,
-          productAccuracy: agg._avg.productAccuracy ? Math.round(agg._avg.productAccuracy * 10) / 10 : null,
-          packaging: agg._avg.packaging ? Math.round(agg._avg.packaging * 10) / 10 : null,
-          deliveryExperience: agg._avg.deliveryExperience ? Math.round(agg._avg.deliveryExperience * 10) / 10 : null,
+          communication: round1(agg.avgCommunication),
+          productAccuracy: round1(agg.avgProductAccuracy),
+          packaging: round1(agg.avgPackaging),
+          deliveryExperience: round1(agg.avgDeliveryExperience),
         },
       },
       page,
@@ -419,39 +396,37 @@ export class ReviewsService {
     const page = query.page ?? 1;
     const limit = query.limit ?? 30;
 
-    const productWhere: Prisma.ReviewWhereInput = {};
+    const productWhere: Record<string, unknown> = {};
     if (query.productId) productWhere.productId = query.productId;
-    if (query.status) productWhere.status = query.status.toUpperCase() as ReviewStatus;
+    if (query.status) productWhere.status = query.status.toUpperCase();
 
     const [productReviews, productTotal] = await Promise.all([
-      this.prisma.review.findMany({
-        where: productWhere,
-        orderBy: { createdAt: 'desc' },
-        skip: (page - 1) * limit,
-        take: limit,
-        include: {
-          user: { select: { id: true, name: true, email: true } },
-          product: { select: { id: true, name: true, slug: true } },
-        },
-      }),
-      this.prisma.review.count({ where: productWhere }),
+      db.orm.public.Review
+        .where(productWhere)
+        .include('user', (user) => user.select('id', 'name', 'email'))
+        .include('product', (product) => product.select('id', 'name', 'slug'))
+        .orderBy((r) => r.createdAt.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+        .all(),
+      db.orm.public.Review.where(productWhere).aggregate((a) => ({ total: a.count() })),
     ]);
 
-    const sellerWhere: Prisma.SellerReviewWhereInput = {};
+    const sellerWhere: Record<string, unknown> = {};
     if (query.sellerId) sellerWhere.sellerUserId = query.sellerId;
-    if (query.status) sellerWhere.status = query.status.toUpperCase() as ReviewStatus;
+    if (query.status) sellerWhere.status = query.status.toUpperCase();
 
     const [sellerReviews, sellerTotal] = await Promise.all([
-      this.prisma.sellerReview.findMany({
-        where: sellerWhere,
-        orderBy: { createdAt: 'desc' },
-        take: limit,
-        include: {
-          author: { select: { id: true, name: true, email: true } },
-          seller: { select: { id: true, name: true, sellerProfile: { select: { storeName: true } } } },
-        },
-      }),
-      this.prisma.sellerReview.count({ where: sellerWhere }),
+      db.orm.public.SellerReview
+        .where(sellerWhere)
+        .include('author', (author) => author.select('id', 'name', 'email'))
+        .include('seller', (seller) =>
+          seller.include('sellerProfile', (profile) => profile.select('storeName')),
+        )
+        .orderBy((r) => r.createdAt.desc())
+        .limit(limit)
+        .all(),
+      db.orm.public.SellerReview.where(sellerWhere).aggregate((a) => ({ total: a.count() })),
     ]);
 
     return {
@@ -477,25 +452,25 @@ export class ReviewsService {
         author: r.author,
         target: r.seller,
       })),
-      totals: { productReviews: productTotal, sellerReviews: sellerTotal },
+      totals: { productReviews: Number(productTotal.total), sellerReviews: Number(sellerTotal.total) },
       page,
-      pages: Math.max(1, Math.ceil(Math.max(productTotal, sellerTotal) / limit)),
+      pages: Math.max(1, Math.ceil(Math.max(Number(productTotal.total), Number(sellerTotal.total)) / limit)),
     };
   }
 
   /** Moderation — hide or restore. Aggregates follow visibility. */
   async moderateProductReview(reviewId: string, status: 'VISIBLE' | 'HIDDEN') {
-    const review = await this.prisma.review.findUnique({ where: { id: reviewId } });
+    const review = await db.orm.public.Review.where({ id: reviewId }).first();
     if (!review) throw new NotFoundException('Review not found');
-    await this.prisma.review.update({ where: { id: reviewId }, data: { status } });
-    await recomputeProductRating(this.prisma, review.productId);
+    await db.orm.public.Review.where({ id: reviewId }).update({ status });
+    await recomputeProductRating(review.productId);
     return { message: `Review ${status === 'HIDDEN' ? 'hidden' : 'restored'}` };
   }
 
   async moderateSellerReview(reviewId: string, status: 'VISIBLE' | 'HIDDEN') {
-    const review = await this.prisma.sellerReview.findUnique({ where: { id: reviewId } });
+    const review = await db.orm.public.SellerReview.where({ id: reviewId }).first();
     if (!review) throw new NotFoundException('Review not found');
-    await this.prisma.sellerReview.update({ where: { id: reviewId }, data: { status } });
+    await db.orm.public.SellerReview.where({ id: reviewId }).update({ status });
     return { message: `Seller review ${status === 'HIDDEN' ? 'hidden' : 'restored'}` };
   }
 }

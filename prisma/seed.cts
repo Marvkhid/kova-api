@@ -1,6 +1,7 @@
 // ============================================================
-// KOVA — Development Seed (DEMO DATA ONLY)
-// Run: npx prisma db seed   (or: npm run db:seed)
+// KOVA — Development Seed (DEMO DATA ONLY) — Prisma 8
+// Run: node -r ts-node/register/transpile-only prisma/seed.cts
+//      (or: npm run db:seed)
 //
 // Rebuilds a realistic Nigerian demo marketplace through the
 // real database layer — the same tables and constraints that
@@ -11,11 +12,15 @@
 // Deterministic: mulberry32 PRNG, fixed constants.
 //
 // Performance: products/orders/events/reviews are inserted in
-// BATCHES (createMany) — a remote pooled Postgres makes
+// BATCHES (createAll) — a remote pooled Postgres makes
 // per-row round-trips unusably slow at 1,000+ products.
+// (.cts + CommonJS: Node 24 + ts-node CJS hook — ESM-resolved
+// .ts scripts cannot import the CJS-built src tree.)
 // ============================================================
 
-import { PrismaClient, Prisma } from '@prisma/client';
+import { db } from '../src/prisma/db';
+import { rawExec } from '../src/prisma/raw-helper';
+import 'dotenv/config';
 import {
   CATEGORIES, SELLERS, BUYERS, DEMO_ADMIN, ITEMS,
   REVIEW_TITLES_5, REVIEW_TITLES_4, REVIEW_TITLES_3, REVIEW_TITLES_2,
@@ -28,7 +33,19 @@ import { applyVariantExtensions } from './catalog-variants';
 import { applyWave3 } from './catalog-wave3';
 import { applyWave4 } from './catalog-wave4';
 
-const prisma = new PrismaClient();
+// ── v8 helpers ────────────────────────────────────────────
+
+const orm = () => db.orm.public;
+
+/** Date → Temporal.PlainDateTime (v8 `timestamp` column input). */
+function pd(d: Date): Temporal.PlainDateTime {
+  return Temporal.PlainDateTime.from(d.toISOString().replace(/\.\d+Z$/, ''));
+}
+
+/** Numeric columns accept strings at runtime; keep kobo-exact values. */
+function dec(v: number): string {
+  return (Math.round(v * 100) / 100).toFixed(2);
+}
 
 // ── Deterministic RNG (mulberry32) ────────────────────────
 
@@ -146,72 +163,71 @@ async function main() {
   console.log('🌱 Seeding KOVA demo marketplace (development data only)…');
 
   // 1. Clear previous demo rows — demo clerkIds only; real users untouched.
-  const demoUsers = await prisma.user.findMany({
-    where: { clerkId: { in: DEMO_CLERK_IDS } },
-    select: { id: true },
-  });
+  const demoUsers = await orm().User
+    .where((m) => m.clerkId.in(DEMO_CLERK_IDS))
+    .select('id')
+    .all();
   const demoIds = demoUsers.map((u) => u.id);
   if (demoIds.length) {
     console.log(`   clearing ${demoIds.length} demo users and related rows…`);
     // Order matters: children first. Products cascade to reviews/cart/wishlist.
-    await prisma.orderEvent.deleteMany({ where: { order: { userId: { in: demoIds } } } });
-    await prisma.orderItem.deleteMany({ where: { order: { userId: { in: demoIds } } } });
-    await prisma.order.deleteMany({ where: { userId: { in: demoIds } } });
-    await prisma.sellerReview.deleteMany({
-      where: { OR: [{ sellerUserId: { in: demoIds } }, { authorId: { in: demoIds } }] },
-    });
-    await prisma.review.deleteMany({
-      where: { OR: [{ userId: { in: demoIds } }, { product: { sellerId: { in: demoIds } } }] },
-    });
-    await prisma.wishlistItem.deleteMany({ where: { userId: { in: demoIds } } });
-    await prisma.product.deleteMany({ where: { sellerId: { in: demoIds } } });
-    await prisma.sellerProfile.deleteMany({ where: { userId: { in: demoIds } } });
-    await prisma.user.deleteMany({ where: { id: { in: demoIds } } });
+    await orm().OrderEvent.where((m) => m.order.some((o) => o.userId.in(demoIds))).delete();
+    await orm().OrderItem.where((m) => m.order.some((o) => o.userId.in(demoIds))).delete();
+    await orm().Order.where((m) => m.userId.in(demoIds)).delete();
+    await orm().SellerReview.where((m) => m.sellerUserId.in(demoIds)).delete();
+    await orm().SellerReview.where((m) => m.authorId.in(demoIds)).delete();
+    await orm().Review.where((m) => m.userId.in(demoIds)).delete();
+    await orm().Review.where((m) => m.product.some((p) => p.sellerId.in(demoIds))).delete();
+    await orm().WishlistItem.where((m) => m.userId.in(demoIds)).delete();
+    await orm().Product.where((m) => m.sellerId.in(demoIds)).delete();
+    await orm().SellerProfile.where((m) => m.userId.in(demoIds)).delete();
+    await orm().User.where((m) => m.id.in(demoIds)).delete();
   }
 
   // 2. Categories (upsert — categories may already exist from earlier seeds)
   const categoryBySlug = new Map<string, string>();
   for (const c of CATEGORIES) {
-    const row = await prisma.category.upsert({
-      where: { slug: c.slug },
-      create: { name: c.name, slug: c.slug, icon: c.icon, sortOrder: c.sortOrder, isActive: true },
-      update: { name: c.name, icon: c.icon, sortOrder: c.sortOrder },
-    });
-    categoryBySlug.set(c.slug, row.id);
+    const existing = await orm().Category.where({ slug: c.slug }).first();
+    if (existing) {
+      await orm().Category.where({ id: existing.id }).update({
+        name: c.name, icon: c.icon, sortOrder: c.sortOrder,
+      });
+      categoryBySlug.set(c.slug, existing.id);
+    } else {
+      const row = await orm().Category.create({
+        name: c.name, slug: c.slug, icon: c.icon, sortOrder: c.sortOrder, isActive: true,
+      });
+      categoryBySlug.set(c.slug, row.id);
+    }
   }
 
   // 3. Demo admin
-  await prisma.user.create({
-    data: {
-      clerkId: DEMO_ADMIN.clerkId,
-      email: DEMO_ADMIN.email,
-      name: DEMO_ADMIN.name,
-      role: 'ADMIN',
-    },
+  await orm().User.create({
+    clerkId: DEMO_ADMIN.clerkId,
+    email: DEMO_ADMIN.email,
+    name: DEMO_ADMIN.name,
+    role: 'ADMIN',
   });
 
   // 4. Sellers + profiles
   const sellerUserBySlug = new Map<string, string>();
   for (const s of SELLERS) {
-    const user = await prisma.user.create({
-      data: {
-        clerkId: s.clerkId,
-        email: s.email,
-        name: s.name,
-        avatarUrl: s.avatarUrl,
-        role: 'SELLER',
-        sellerProfile: {
-          create: {
-            storeName: s.storeName,
-            storeSlug: s.storeSlug,
-            description: s.description,
-            location: s.location,
-            logoUrl: s.logoUrl,
-            bannerUrl: s.bannerUrl,
-            isVerified: s.isVerified,
-          },
-        },
-      },
+    const user = await orm().User.create({
+      clerkId: s.clerkId,
+      email: s.email,
+      name: s.name,
+      avatarUrl: s.avatarUrl,
+      role: 'SELLER',
+    });
+    await orm().SellerProfile.create({
+      userId: user.id,
+      storeName: s.storeName,
+      storeSlug: s.storeSlug,
+      description: s.description,
+      location: s.location,
+      logoUrl: s.logoUrl,
+      bannerUrl: s.bannerUrl,
+      isVerified: s.isVerified,
     });
     sellerUserBySlug.set(s.storeSlug, user.id);
   }
@@ -219,8 +235,8 @@ async function main() {
   // 5. Buyers
   const buyerIds: string[] = [];
   for (const b of BUYERS) {
-    const user = await prisma.user.create({
-      data: { clerkId: b.clerkId, email: b.email, name: b.name, role: 'BUYER' },
+    const user = await orm().User.create({
+      clerkId: b.clerkId, email: b.email, name: b.name, role: 'BUYER',
     });
     buyerIds.push(user.id);
   }
@@ -233,7 +249,7 @@ async function main() {
   );
   console.log(`   catalog expands to ${specs.length} products…`);
 
-  const productCreate: Prisma.ProductCreateManyInput[] = [];
+  const productCreate: Record<string, unknown>[] = [];
   for (const spec of specs) {
     const daysAgo = intBetween(2, 240);
     const createdAt = new Date(Date.now() - daysAgo * 86400000);
@@ -246,8 +262,8 @@ async function main() {
       name: spec.name,
       slug: spec.slug,
       description: composeDescription(spec.item, variantNote),
-      price: new Prisma.Decimal(spec.price),
-      originalPrice: spec.originalPrice ? new Prisma.Decimal(spec.originalPrice) : null,
+      price: dec(spec.price),
+      originalPrice: spec.originalPrice ? dec(spec.originalPrice) : null,
       productType: spec.type,
       status,
       badge: daysAgo <= 21 ? 'NEW' : chance(0.12) ? 'HOT' : spec.originalPrice ? 'SALE' : null,
@@ -256,14 +272,14 @@ async function main() {
       inStock: spec.type === 'DIGITAL' ? true : chance(0.93),
       sellerId: sellerUserBySlug.get(spec.sellerSlug)!,
       categoryId: categoryBySlug.get(spec.categorySlug)!,
-      createdAt,
-      updatedAt: createdAt,
+      createdAt: pd(createdAt),
+      updatedAt: pd(createdAt),
       viewCount: intBetween(15, 1600),
     });
   }
 
   for (const batch of chunk(productCreate, 250)) {
-    await prisma.product.createMany({ data: batch });
+    await orm().Product.createAll(batch as never);
   }
   const published = productCreate.filter((p) => p.status === 'PUBLISHED').length;
   console.log(`   ${published} published · ${productCreate.length - published} left as drafts`);
@@ -271,10 +287,10 @@ async function main() {
   // Map slug → id for order/review wiring
   const idBySlug = new Map<string, string>();
   for (const batch of chunk(specs.map((s) => s.slug), 400)) {
-    const rows = await prisma.product.findMany({
-      where: { slug: { in: batch } },
-      select: { id: true, slug: true, price: true, productType: true, sellerId: true, createdAt: true },
-    });
+    const rows = await orm().Product
+      .where((m) => m.slug.in(batch))
+      .select('id', 'slug', 'price', 'productType', 'sellerId', 'createdAt')
+      .all();
     for (const r of rows) idBySlug.set(r.slug, r.id);
   }
 
@@ -304,15 +320,16 @@ async function main() {
   // Build every order row in memory, then insert in three batched passes:
   // orders → order_items → order_events (ids resolved via orderNumber).
   const carriers = ['GIG Logistics', 'Kwik Delivery', 'DHL Nigeria'];
-  const orderRows: Prisma.OrderCreateManyInput[] = [];
-  const itemRows: (Prisma.OrderItemCreateManyInput & { orderNumber: string })[] = [];
-  const eventRows: (Prisma.OrderEventCreateManyInput & { orderNumber: string })[] = [];
+  const orderRows: Record<string, unknown>[] = [];
+  const itemRows: (Record<string, unknown> & { orderNumber: string })[] = [];
+  const eventRows: (Record<string, unknown> & { orderNumber: string })[] = [];
   const reviewSpecs: { buyerId: string; slug: string; at: number }[] = [];
 
   orderSpecs.forEach((os, i) => {
     const prod = specs.find((s) => s.slug === os.slug)!;
     const orderNumber = `KV-${100000 + i}`;
-    const createdAt = Date.now() - os.daysAgo * 86400000;
+    const createdAtMs = Date.now() - os.daysAgo * 86400000;
+    const createdAt = new Date(createdAtMs);
     const subtotalKobo = Math.round(prod.price * 100) * os.qty; // kobo-exact
     const shipping = prod.type === 'PHYSICAL' && os.track !== 'CANCELLED'
       ? Math.round(between(2000, 6000) / 500) * 500
@@ -326,15 +343,15 @@ async function main() {
       status: os.track,
       paymentStatus: paid ? 'PAID' : 'REFUNDED',
       paymentRef: paid ? `demo_pay_${i + 1}` : null,
-      subtotal: new Prisma.Decimal(subtotalKobo).div(100),
-      shipping: new Prisma.Decimal(shipping),
-      total: new Prisma.Decimal(totalKobo).div(100),
+      subtotal: dec(subtotalKobo / 100),
+      shipping: dec(shipping),
+      total: dec(totalKobo / 100),
       // City-level demo address — no real private addresses.
       shippingAddress: {
         city: pick(NIGERIAN_CITIES), state: 'Demo State', country: 'Nigeria', level: 'city',
-      } as Prisma.InputJsonValue,
-      createdAt: new Date(createdAt),
-      updatedAt: new Date(createdAt),
+      },
+      createdAt: pd(createdAt),
+      updatedAt: pd(createdAt),
     });
 
     itemRows.push({
@@ -342,10 +359,10 @@ async function main() {
       orderId: '', // resolved after insert
       productId: idBySlug.get(os.slug)!,
       quantity: os.qty,
-      price: new Prisma.Decimal(prod.price),
-      fulfillmentStatus: os.track as Prisma.OrderItemCreateManyInput['fulfillmentStatus'],
-      createdAt: new Date(createdAt),
-      updatedAt: new Date(createdAt),
+      price: dec(prod.price),
+      fulfillmentStatus: os.track,
+      createdAt: pd(createdAt),
+      updatedAt: pd(createdAt),
     });
 
     // Event timeline mirrors the orders module lifecycle
@@ -356,40 +373,40 @@ async function main() {
       eventRows.push({
         orderNumber,
         orderId: '', // resolved after insert
-        status: status as Prisma.OrderEventCreateManyInput['status'],
+        status,
         message: status === 'SHIPPED' && carrier ? `Shipped — handed to ${carrier}` : TRACK_MESSAGE[status],
-        createdAt: new Date(createdAt + Math.round(ev * between(4, 20) * 3600000)),
+        createdAt: pd(new Date(createdAtMs + Math.round(ev * between(4, 20) * 3600000))),
       });
     });
 
     if (paid && os.track === 'DELIVERED' && chance(0.8)) {
-      reviewSpecs.push({ buyerId: os.buyerId, slug: os.slug, at: createdAt + intBetween(2, 14) * 86400000 });
+      reviewSpecs.push({ buyerId: os.buyerId, slug: os.slug, at: createdAtMs + intBetween(2, 14) * 86400000 });
     }
   });
 
   for (const batch of chunk(orderRows, 250)) {
-    await prisma.order.createMany({ data: batch });
+    await orm().Order.createAll(batch as never);
   }
   const orderIds = new Map<string, string>();
   for (const batch of chunk(orderRows.map((o) => o.orderNumber as string), 400)) {
-    const rows = await prisma.order.findMany({
-      where: { orderNumber: { in: batch } },
-      select: { id: true, orderNumber: true },
-    });
+    const rows = await orm().Order
+      .where((m) => m.orderNumber.in(batch))
+      .select('id', 'orderNumber')
+      .all();
     for (const r of rows) orderIds.set(r.orderNumber, r.id);
   }
   for (const row of itemRows) row.orderId = orderIds.get(row.orderNumber)!;
   for (const row of eventRows) row.orderId = orderIds.get(row.orderNumber)!;
 
   for (const batch of chunk(itemRows, 400)) {
-    await prisma.orderItem.createMany({
-      data: batch.map(({ orderNumber: _o, ...rest }) => rest),
-    });
+    await orm().OrderItem.createAll(
+      batch.map(({ orderNumber: _o, ...rest }) => rest) as never,
+    );
   }
   for (const batch of chunk(eventRows, 500)) {
-    await prisma.orderEvent.createMany({
-      data: batch.map(({ orderNumber: _o, ...rest }) => rest),
-    });
+    await orm().OrderEvent.createAll(
+      batch.map(({ orderNumber: _o, ...rest }) => rest) as never,
+    );
   }
   const orderCount = orderRows.length;
   console.log(`   ${orderCount} orders with full event timelines`);
@@ -397,9 +414,9 @@ async function main() {
   // 8. Reviews — verifiedPurchase=true is TRUE here because a real PAID
   //    order chain for the same (buyer, product) pair exists above.
   const seenProductReview = new Set<string>();
-  const reviewRows: Prisma.ReviewCreateManyInput[] = [];
+  const reviewRows: Record<string, unknown>[] = [];
   const seenSellerReview = new Set<string>();
-  const sellerReviewRows: Prisma.SellerReviewCreateManyInput[] = [];
+  const sellerReviewRows: Record<string, unknown>[] = [];
 
   for (const rs of reviewSpecs) {
     const pairKey = `${rs.buyerId}:${rs.slug}`;
@@ -416,6 +433,7 @@ async function main() {
     const city = pick(NIGERIAN_CITIES);
     const comment = fillTemplate(pick(pool[1]), spec.item, city);
 
+    const at = new Date(Math.min(rs.at, Date.now() - 3600000));
     reviewRows.push({
       userId: rs.buyerId,
       productId: idBySlug.get(rs.slug)!,
@@ -423,8 +441,8 @@ async function main() {
       title: pick(pool[0]),
       comment,
       verifiedPurchase: true, // backed by the real PAID order created above
-      createdAt: new Date(Math.min(rs.at, Date.now() - 3600000)),
-      updatedAt: new Date(Math.min(rs.at, Date.now() - 3600000)),
+      createdAt: pd(at),
+      updatedAt: pd(at),
     });
 
     // Seller reputation rides along for most delivered purchases
@@ -432,7 +450,7 @@ async function main() {
     const sKey = `${sellerUserId}:${rs.buyerId}`;
     if (!seenSellerReview.has(sKey) && chance(0.6)) {
       seenSellerReview.add(sKey);
-      const at = new Date(rs.at + 86400000);
+      const sAt = new Date(rs.at + 86400000);
       sellerReviewRows.push({
         sellerUserId,
         authorId: rs.buyerId,
@@ -442,23 +460,23 @@ async function main() {
         packaging: 3 + intBetween(0, 2),
         deliveryExperience: 3 + intBetween(0, 2),
         comment: chance(0.35) ? 'Good communication and quick dispatch.' : null,
-        createdAt: at,
-        updatedAt: at,
+        createdAt: pd(sAt),
+        updatedAt: pd(sAt),
       });
     }
   }
 
   for (const batch of chunk(reviewRows, 300)) {
-    await prisma.review.createMany({ data: batch });
+    await orm().Review.createAll(batch as never);
   }
   for (const batch of chunk(sellerReviewRows, 300)) {
-    await prisma.sellerReview.createMany({ data: batch });
+    await orm().SellerReview.createAll(batch as never);
   }
   const productReviewCount = reviewRows.length;
 
   // 9. Recompute aggregates FROM Review / OrderItem rows — the exact math
   //    the reviews module uses on every mutation, applied in one pass.
-  await prisma.$executeRawUnsafe(`
+  await rawExec(db.raw.sql`
     UPDATE products p SET
       rating = COALESCE(ROUND(r.avg_rating::numeric, 1), 0),
       "reviewCount" = COALESCE(r.cnt, 0)
@@ -468,12 +486,12 @@ async function main() {
     ) r
     WHERE r."productId" = p.id
   `);
-  await prisma.$executeRawUnsafe(`
+  await rawExec(db.raw.sql`
     UPDATE products SET rating = 0, "reviewCount" = 0
     WHERE id NOT IN (SELECT "productId" FROM reviews WHERE status = 'VISIBLE')
   `);
   // buyCount = paid order quantity, matching the production aggregate meaning
-  await prisma.$executeRawUnsafe(`
+  await rawExec(db.raw.sql`
     UPDATE products p SET "buyCount" = COALESCE(x.q, 0)
     FROM (
       SELECT oi."productId", SUM(oi.quantity) AS q
@@ -483,7 +501,7 @@ async function main() {
     ) x
     WHERE x."productId" = p.id
   `);
-  await prisma.$executeRawUnsafe(`
+  await rawExec(db.raw.sql`
     UPDATE products SET "buyCount" = 0
     WHERE id NOT IN (
       SELECT oi."productId" FROM order_items oi
@@ -492,15 +510,21 @@ async function main() {
   `);
 
   // 10. Wishlist for a few buyers (exercises the wishlist path end-to-end)
-  const wishlistRows: Prisma.WishlistItemCreateManyInput[] = [];
+  const wishlistRows: Record<string, unknown>[] = [];
+  const seenWishlist = new Set<string>();
   for (const buyerId of buyerIds.slice(0, 6)) {
     const n = intBetween(1, 4);
     for (let i = 0; i < n; i++) {
       const target = pick(specs);
+      const key = `${buyerId}:${target.slug}`;
+      if (seenWishlist.has(key)) continue;
+      seenWishlist.add(key);
       wishlistRows.push({ userId: buyerId, productId: idBySlug.get(target.slug)! });
     }
   }
-  await prisma.wishlistItem.createMany({ data: wishlistRows, skipDuplicates: true });
+  if (wishlistRows.length) {
+    await orm().WishlistItem.createAll(wishlistRows as never);
+  }
 
   // ── Data-quality verification ───────────────────────────
   await verify(specs.length, orderCount, productReviewCount);
@@ -515,41 +539,59 @@ async function main() {
 // ── Verification ──────────────────────────────────────────
 
 async function verify(expectedProducts: number, expectedOrders: number, expectedReviews: number) {
+  void expectedProducts;
   const checks: [string, boolean, string][] = [];
 
-  const total = await prisma.product.count();
+  const totalAgg = await orm().Product.aggregate((a) => ({ total: a.count() }));
+  const total = Number(totalAgg.total);
   checks.push(['product count ≥ 1000 (5 sellers × 200+)', total >= 1000, `${total}`]);
 
-  const noCategory = await prisma.product.count({ where: { categoryId: null } });
-  checks.push(['every product has a category', noCategory === 0, `${noCategory} missing`]);
+  // every product has a category: total − categorized = missing
+  const categorizedAgg = await orm().Product
+    .where((m) => m.categoryId.isNotNull())
+    .aggregate((a) => ({ n: a.count() }));
+  const missingCategory = total - Number(categorizedAgg.n);
+  checks.push(['every product has a category', missingCategory === 0, `${missingCategory} missing`]);
 
-  const physical = await prisma.product.findMany({
-    where: { productType: 'PHYSICAL', status: 'PUBLISHED' },
-    select: { images: true },
-  });
-  checks.push(['published physical products have ≥3 images', physical.every((p) => p.images.length >= 3), '']);
+  const physical = await orm().Product
+    .where({ productType: 'PHYSICAL', status: 'PUBLISHED' })
+    .select('images')
+    .all();
+  checks.push(['published physical products have ≥3 images', physical.every((p) => (p.images?.length ?? 0) >= 3), '']);
 
-  const digital = await prisma.product.findMany({
-    where: { productType: 'DIGITAL', status: 'PUBLISHED' },
-    select: { images: true },
-  });
-  checks.push(['published digital products have a cover', digital.every((p) => p.images.length >= 1), '']);
+  const digital = await orm().Product
+    .where({ productType: 'DIGITAL', status: 'PUBLISHED' })
+    .select('images')
+    .all();
+  checks.push(['published digital products have a cover', digital.every((p) => (p.images?.length ?? 0) >= 1), '']);
 
-  const unverified = await prisma.review.count({ where: { verifiedPurchase: false } });
+  const unverifiedAgg = await orm().Review
+    .where({ verifiedPurchase: false })
+    .aggregate((a) => ({ n: a.count() }));
+  const unverified = Number(unverifiedAgg.n);
   checks.push(['every review traces to a real PAID order', unverified === 0, `${unverified} unverified`]);
 
-  const orderEvents = await prisma.orderEvent.count();
+  const orderEventsAgg = await orm().OrderEvent.aggregate((a) => ({ n: a.count() }));
+  const orderEvents = Number(orderEventsAgg.n);
   checks.push(['order timelines populated', expectedOrders > 0 && orderEvents >= expectedOrders, `${orderEvents} events`]);
 
-  const zeroPrice = await prisma.product.count({ where: { price: { lte: 0 } } });
+  const zeroPriceAgg = await orm().Product
+    .where((m) => m.price.lte('0' as never))
+    .aggregate((a) => ({ n: a.count() }));
+  const zeroPrice = Number(zeroPriceAgg.n);
   checks.push(['no zero/negative prices', zeroPrice === 0, `${zeroPrice} bad`]);
 
-  const aggMismatch = await prisma.product.count({
-    where: { rating: 0, reviewCount: { gt: 0 } },
-  });
+  const aggMismatchAgg = await orm().Product
+    .where({ rating: 0 })
+    .where((m) => m.reviewCount.gt(0))
+    .aggregate((a) => ({ n: a.count() }));
+  const aggMismatch = Number(aggMismatchAgg.n);
   checks.push(['rating aggregates consistent with review rows', aggMismatch === 0, `${aggMismatch} mismatched`]);
 
-  const draftCount = await prisma.product.count({ where: { status: 'DRAFT' } });
+  const draftAgg = await orm().Product
+    .where({ status: 'DRAFT' })
+    .aggregate((a) => ({ n: a.count() }));
+  const draftCount = Number(draftAgg.n);
   checks.push(['a small share of drafts exists (realistic pipeline)', draftCount > 0 && draftCount < total * 0.1, `${draftCount} drafts`]);
 
   let failed = 0;
@@ -560,16 +602,11 @@ async function verify(expectedProducts: number, expectedOrders: number, expected
   }
 
   // Per-seller minimums (requirement: each seller ≥ 200 products)
-  const bySeller = await prisma.product.groupBy({
-    by: ['sellerId'],
-    _count: { _all: true },
-  });
-  const sellers = await prisma.sellerProfile.findMany({
-    select: { userId: true, storeName: true },
-  });
+  const bySeller = await orm().Product.groupBy('sellerId').aggregate((a) => ({ n: a.count() }));
+  const sellers = await orm().SellerProfile.select('userId', 'storeName').all();
   const nameOf = new Map(sellers.map((s) => [s.userId, s.storeName]));
   for (const row of bySeller) {
-    const n = row._count._all;
+    const n = Number(row.n);
     const ok = n >= 200;
     if (!ok) failed++;
     console.log(`   ${ok ? '✓' : '✗'} seller ${nameOf.get(row.sellerId) ?? row.sellerId} has ≥ 200 products${!ok ? ` — ${n}` : ''}`);
@@ -581,4 +618,4 @@ async function verify(expectedProducts: number, expectedOrders: number, expected
 
 main()
   .catch((e) => { console.error(e); process.exit(1); })
-  .finally(() => prisma.$disconnect());
+  .then(() => db.close());

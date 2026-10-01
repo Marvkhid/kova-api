@@ -6,18 +6,17 @@
   "private": true,
   "license": "MIT",
   "scripts": {
-    "build": "prisma generate && nest build",
-    "postinstall": "prisma generate",
+    "build": "npx prisma contract emit && nest build",
+    "postinstall": "npx prisma contract emit",
     "start": "npm run start:prod",
-    "start:prod": "npx prisma migrate deploy && node dist/src/main.js",
+    "start:prod": "node dist/src/main.js",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\"",
-    "db:generate": "prisma generate",
-    "db:migrate": "prisma migrate dev --name",
-    "db:deploy": "prisma migrate deploy",
-    "db:studio": "prisma studio",
-    "db:seed": "ts-node prisma/seed.ts"
+    "db:generate": "npx prisma contract emit",
+    "db:diff-apply": "npx prisma db update",
+    "db:deploy": "npx prisma db migrate",
+    "db:seed": "node -r ts-node/register/transpile-only prisma/seed.cts"
   },
   "dependencies": {
     "@clerk/clerk-sdk-node": "^5.1.6",
@@ -28,16 +27,19 @@
     "@nestjs/passport": "^10.0.0",
     "@nestjs/platform-express": "^10.4.22",
     "@nestjs/serve-static": "^4.0.2",
-    "@prisma/client": "^5.22.0",
+    "@prisma/orm-postgres": "^8.0.0-rc.13",
     "bcryptjs": "^3.0.3",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.0",
     "cloudinary": "^2.10.0",
+    "dotenv": "^16.4.5",
     "multer": "^2.1.1",
     "passport": "^0.6.0",
     "passport-jwt": "^4.0.1",
     "reflect-metadata": "^0.1.13",
-    "rxjs": "^7.8.1"
+    "rxjs": "^7.8.1",
+    "temporal-polyfill": "^1.0.5",
+    "temporal-spec": "^1.0.1"
   },
   "devDependencies": {
     "@nestjs/cli": "^10.4.9",
@@ -50,12 +52,9 @@
     "@types/passport-jwt": "^3.0.9",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-prettier": "^5.5.5",
-    "prisma": "^7.10.0",
+    "prisma": "^8.0.0-rc.19",
     "sharp": "^0.35.4",
     "ts-node": "^10.9.1",
     "typescript": "^5.9.3"
-  },
-  "prisma": {
-    "seed": "ts-node prisma/seed.ts"
   }
 }

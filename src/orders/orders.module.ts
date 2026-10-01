@@ -1,5 +1,5 @@
 // ============================================================
-// KOVA API — Orders Module (v2)
+// KOVA API — Orders Module (v2, Prisma 8)
 // Real order lifecycle with an append-only event timeline.
 //   • Buyer: create order, list own orders, view own order timeline
 //   • Seller: view orders containing their items, advance fulfillment
@@ -40,8 +40,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { Type } from 'class-transformer';
-import { PrismaService } from '../prisma/prisma.module';
-import type { FulfillmentStatus, OrderStatus } from '@prisma/client';
+import { db } from '../prisma/db';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard, Roles } from '../auth/guards/roles.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
@@ -59,6 +58,13 @@ function sumCents(pairs: { price: unknown; quantity: number }[]): number {
 }
 
 // ── Status lifecycle rules ────────────────────────────────
+
+type FulfillmentStatus =
+  | 'PENDING' | 'PAID' | 'PROCESSING' | 'PACKED' | 'SHIPPED'
+  | 'IN_TRANSIT' | 'OUT_FOR_DELIVERY' | 'DELIVERED' | 'CANCELLED';
+type OrderStatus =
+  | 'PENDING' | 'PAID' | 'PROCESSING' | 'PACKED' | 'SHIPPED'
+  | 'IN_TRANSIT' | 'OUT_FOR_DELIVERY' | 'DELIVERED' | 'CANCELLED' | 'REFUNDED';
 
 const PHYSICAL_FLOW: FulfillmentStatus[] = [
   'PENDING', 'PAID', 'PROCESSING', 'PACKED',
@@ -137,26 +143,43 @@ export class SellerOrdersQueryDto {
   @IsOptional() @Type(() => Number) @IsNumber() @Min(1) page?: number;
 }
 
+// ── Shared projections ────────────────────────────────────
+
+/** Product line projection used across order reads. */
+function itemsWithProduct(extraSellerFields = false) {
+  return (item: any) =>
+    extraSellerFields
+      ? item
+          .include('product', (p: any) =>
+            p
+              .select('id', 'name', 'slug', 'productType', 'images', 'sellerId')
+              .include('seller', (s: any) =>
+                s.select('id', 'name').include('sellerProfile', (sp: any) => sp.select('storeName')),
+              ),
+          )
+      : item.include('product', (p: any) => p.select('id', 'name', 'slug', 'productType', 'images', 'sellerId'));
+}
+
 // ── Service ───────────────────────────────────────────────
 
 @Injectable()
 export class OrdersService {
-  constructor(private prisma: PrismaService) {}
-
   /** Load an order the requester is authorized to see. */
   private async getAuthorizedOrder(orderId: string, user: any): Promise<{ order: any; role: 'buyer' | 'seller' | 'admin' }> {
-    const order = await this.prisma.order.findUnique({
-      where: { id: orderId },
-      include: {
-        items: { include: { product: { select: { id: true, name: true, slug: true, productType: true, images: true, sellerId: true } } } },
-      },
-    });
+    const order = await db.orm.public.Order
+      .include('items', (items: any) =>
+        items
+          .include('product', (p: any) => p.select('id', 'name', 'slug', 'productType', 'images', 'sellerId'))
+          .select('id', 'fulfillmentStatus'),
+      )
+      .where({ id: orderId })
+      .first();
     if (!order) throw new NotFoundException('Order not found');
 
     if (user.role === 'ADMIN') return { order, role: 'admin' };
     if (order.userId === user.id) return { order, role: 'buyer' };
 
-    const isSellerOnOrder = order.items.some((i) => i.product.sellerId === user.id);
+    const isSellerOnOrder = (order.items as any[]).some((i: any) => i.product.sellerId === user.id);
     if (isSellerOnOrder) return { order, role: 'seller' };
 
     // Never trust the order ID alone.
@@ -171,9 +194,12 @@ export class OrdersService {
     }
     const productIds = [...merged.keys()];
 
-    const products = await this.prisma.product.findMany({
-      where: { id: { in: productIds }, status: 'PUBLISHED' },
-    });
+    const products = productIds.length
+      ? await db.orm.public.Product
+          .where((p) => p.id.in(productIds))
+          .where({ status: 'PUBLISHED' })
+          .all()
+      : [];
     if (products.length !== productIds.length) {
       throw new BadRequestException('One or more products are unavailable');
     }
@@ -185,7 +211,6 @@ export class OrdersService {
       productId: p.id,
       quantity: merged.get(p.id)!,
       price: p.price, // locked at purchase time
-      fulfillmentStatus: 'PENDING' as FulfillmentStatus,
       product: p,
     }));
 
@@ -197,60 +222,71 @@ export class OrdersService {
     const shipping = hasPhysical && subtotal < 50000 ? 2500 : 0;
     const total = subtotal + shipping;
 
-    const order = await this.prisma.order.create({
-      data: {
-        userId,
-        subtotal,
-        shipping,
-        total,
-        shippingAddress: dto.shippingAddress ?? undefined,
+    // Nested create + the event write run atomically.
+    const order = await db.transaction(async (tx) => {
+      const created = await tx.orm.public.Order
+        .include('items', (items: any) =>
+          items.include('product', (p: any) => p.select('id', 'name', 'slug', 'productType', 'images')),
+        )
+        .create({
+          userId,
+          subtotal,
+          shipping,
+          total,
+          shippingAddress: dto.shippingAddress ?? null,
+          status: 'PENDING',
+          items: (r: any) =>
+            r.create(
+              itemRows.map(({ product: _p, ...row }) => ({
+                ...row,
+                fulfillmentStatus: 'PENDING',
+              })),
+            ),
+        } as never);
+      await tx.orm.public.OrderEvent.create({
+        orderId: created.id,
         status: 'PENDING',
-        items: {
-          create: itemRows.map(({ product: _p, ...row }) => row),
-        },
-      },
-      include: {
-        items: { include: { product: { select: { id: true, name: true, slug: true, productType: true, images: true } } } },
-      },
-    });
-
-    await this.prisma.orderEvent.create({
-      data: { orderId: order.id, status: 'PENDING', message: 'Order placed' },
+        message: 'Order placed',
+      });
+      return created;
     });
 
     return this.serializeOrder(order);
   }
 
   async findAllMine(userId: string) {
-    const orders = await this.prisma.order.findMany({
-      where: { userId },
-      include: {
-        items: { include: { product: { select: { id: true, name: true, slug: true, productType: true, images: true, sellerId: true, seller: { select: { name: true, sellerProfile: { select: { storeName: true } } } } } } } },
-        events: { orderBy: { createdAt: 'asc' } },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
+    const orders = await db.orm.public.Order
+      .include('items', (items: any) =>
+        items.include('product', (p: any) =>
+          p
+            .select('id', 'name', 'slug', 'productType', 'images', 'sellerId')
+            .include('seller', (s: any) =>
+              s.select('name').include('sellerProfile', (sp: any) => sp.select('storeName')),
+            ),
+        ),
+      )
+      .include('events', (events: any) => events.orderBy((e: any) => e.createdAt.asc()))
+      .where({ userId })
+      .orderBy((o) => o.createdAt.desc())
+      .all();
     return orders.map((o) => this.serializeOrder(o));
   }
 
   async findOneForUser(orderId: string, user: any) {
     const { order } = await this.getAuthorizedOrder(orderId, user);
-    const full = await this.prisma.order.findUnique({
-      where: { id: order.id },
-      include: {
-        items: {
-          include: {
-            product: {
-              select: {
-                id: true, name: true, slug: true, productType: true, images: true, sellerId: true,
-                seller: { select: { name: true, sellerProfile: { select: { storeName: true, storeSlug: true } } } },
-              },
-            },
-          },
-        },
-        events: { orderBy: { createdAt: 'asc' } },
-      },
-    });
+    const full = await db.orm.public.Order
+      .include('items', (items: any) =>
+        items.include('product', (p: any) =>
+          p
+            .select('id', 'name', 'slug', 'productType', 'images', 'sellerId')
+            .include('seller', (s: any) =>
+              s.select('name').include('sellerProfile', (sp: any) => sp.select('storeName', 'storeSlug')),
+            ),
+        ),
+      )
+      .include('events', (events: any) => events.orderBy((e: any) => e.createdAt.asc()))
+      .where({ id: order.id })
+      .first();
     return this.serializeOrder(full);
   }
 
@@ -258,34 +294,32 @@ export class OrdersService {
   async findAllForSeller(sellerId: string, query: SellerOrdersQueryDto) {
     const page = query.page ?? 1;
     const limit = 20;
-    const where: any = {
-      items: { some: { product: { sellerId } } },
-    };
+
+    let filtered = db.orm.public.Order
+      .where((o) => o.items.some((i: any) => i.product.some({ sellerId })));
     if (query.status) {
-      where.items = {
-        some: {
-          product: { sellerId },
-          fulfillmentStatus: query.status.toUpperCase(),
-        },
-      };
+      filtered = filtered.where((o) =>
+        o.items.some((i: any) =>
+          i.product.some({ sellerId, fulfillmentStatus: query.status!.toUpperCase() as FulfillmentStatus }),
+        ),
+      );
     }
 
-    const [orders, total] = await Promise.all([
-      this.prisma.order.findMany({
-        where,
-        include: {
-          user: { select: { id: true, name: true, email: true } },
-          items: {
-            where: { product: { sellerId } }, // seller sees only their own lines
-            include: { product: { select: { id: true, name: true, slug: true, productType: true, images: true } } },
-          },
-        },
-        orderBy: { createdAt: 'desc' },
-        skip: (page - 1) * limit,
-        take: limit,
-      }),
-      this.prisma.order.count({ where }),
+    const [orders, totalAgg] = await Promise.all([
+      filtered
+        .include('user', (u: any) => u.select('id', 'name', 'email'))
+        .include('items', (items: any) =>
+          items
+            .where((i: any) => i.product.some({ sellerId })) // seller sees only their own lines
+            .include('product', (p: any) => p.select('id', 'name', 'slug', 'productType', 'images')),
+        )
+        .orderBy((o) => o.createdAt.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+        .all(),
+      filtered.aggregate((a) => ({ total: a.count() })),
     ]);
+    const total = Number(totalAgg.total);
 
     return {
       orders: orders.map((o) => this.serializeSellerOrder(o, sellerId)),
@@ -302,7 +336,7 @@ export class OrdersService {
    */
   async updateItemFulfillment(orderId: string, itemId: string, user: any, dto: UpdateItemFulfillmentDto) {
     const { order, role } = await this.getAuthorizedOrder(orderId, user);
-    const item = order.items.find((i) => i.id === itemId);
+    const item = order.items.find((i: any) => i.id === itemId);
     if (!item) throw new NotFoundException('Order item not found');
 
     if (role === 'seller' && item.product.sellerId !== user.id) {
@@ -344,24 +378,24 @@ export class OrdersService {
     if (dto.trackingNumber !== undefined) data.trackingNumber = dto.trackingNumber;
     if (dto.carrier !== undefined) data.carrier = dto.carrier;
 
-    const [updatedItem] = await this.prisma.$transaction([
-      this.prisma.orderItem.update({ where: { id: itemId }, data }),
-      this.prisma.orderEvent.create({
-        data: {
-          orderId,
-          status: this.orderStatusForStatus(next),
-          message: dto.message?.trim() || ITEM_EVENT_MESSAGES[next],
-        },
-      }),
-    ]);
+    const updatedItem = await db.transaction(async (tx) => {
+      const updated = await tx.orm.public.OrderItem.where({ id: itemId }).update(data);
+      await tx.orm.public.OrderEvent.create({
+        orderId,
+        status: this.orderStatusForStatus(next),
+        message: dto.message?.trim() || ITEM_EVENT_MESSAGES[next],
+      });
+      return updated;
+    });
 
     // Recompute the order-level status from its items
-    const refreshed = await this.prisma.order.findUnique({
-      where: { id: orderId },
-      include: { items: { include: { product: { select: { productType: true } } } } },
-    });
-    const derived = orderStatusFor(refreshed.items);
-    await this.prisma.order.update({ where: { id: orderId }, data: { status: derived } });
+    const refreshed = await db.orm.public.Order
+      .include('items', (items: any) => items.include('product', (p: any) => p.select('productType')))
+      .where({ id: orderId })
+      .first();
+    if (!refreshed) throw new NotFoundException('Order not found');
+    const derived = orderStatusFor(refreshed.items as any);
+    await db.orm.public.Order.where({ id: orderId }).update({ status: derived });
 
     return this.serializeItem(updatedItem);
   }
@@ -370,41 +404,38 @@ export class OrdersService {
   async findAllForAdmin(query: SellerOrdersQueryDto) {
     const page = query.page ?? 1;
     const limit = 30;
-    const where: any = {};
-    if (query.status) where.status = query.status.toUpperCase();
+    let filtered = db.orm.public.Order;
+    if (query.status) filtered = filtered.where({ status: query.status.toUpperCase() as OrderStatus });
 
-    const [orders, total] = await Promise.all([
-      this.prisma.order.findMany({
-        where,
-        include: {
-          user: { select: { id: true, name: true, email: true } },
-          items: {
-            include: {
-              product: {
-                select: {
-                  id: true, name: true, slug: true, productType: true,
-                  seller: { select: { id: true, name: true, sellerProfile: { select: { storeName: true } } } },
-                },
-              },
-            },
-          },
-        },
-        orderBy: { createdAt: 'desc' },
-        skip: (page - 1) * limit,
-        take: limit,
-      }),
-      this.prisma.order.count({ where }),
+    const [orders, totalAgg] = await Promise.all([
+      filtered
+        .include('user', (u: any) => u.select('id', 'name', 'email'))
+        .include('items', (items: any) =>
+          items.include('product', (p: any) =>
+            p
+              .select('id', 'name', 'slug', 'productType')
+              .include('seller', (s: any) =>
+                s.select('id', 'name').include('sellerProfile', (sp: any) => sp.select('storeName')),
+              ),
+          ),
+        )
+        .orderBy((o) => o.createdAt.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+        .all(),
+      filtered.aggregate((a) => ({ total: a.count() })),
     ]);
+    const total = Number(totalAgg.total);
     return { orders: orders.map((o) => this.serializeOrder(o)), total, page, pages: Math.ceil(total / limit) };
   }
 
   // ── Payment integration (used by Paystack module) ────────
 
   async confirmPayment(orderId: string, reference: string) {
-    const order = await this.prisma.order.findUnique({
-      where: { id: orderId },
-      include: { items: true },
-    });
+    const order = await db.orm.public.Order
+      .include('items', (items: any) => items.select('id', 'productId', 'quantity', 'fulfillmentStatus'))
+      .where({ id: orderId })
+      .first();
     if (!order) throw new NotFoundException('Order not found');
 
     // Idempotent — never double-apply a payment
@@ -412,45 +443,49 @@ export class OrdersService {
       return this.findOneForUserAdmin(orderId);
     }
 
-    await this.prisma.$transaction([
-      this.prisma.order.update({
-        where: { id: orderId },
-        data: { paymentStatus: 'PAID', paymentRef: reference, status: 'PAID' },
-      }),
-      this.prisma.orderItem.updateMany({
-        where: { orderId, fulfillmentStatus: 'PENDING' },
-        data: { fulfillmentStatus: 'PAID' },
-      }),
+    await db.transaction(async (tx) => {
+      await tx.orm.public.Order.where({ id: orderId }).update({
+        paymentStatus: 'PAID',
+        paymentRef: reference,
+        status: 'PAID',
+      });
+      await tx.orm.public.OrderItem
+        .where({ orderId, fulfillmentStatus: 'PENDING' })
+        .update({ fulfillmentStatus: 'PAID' });
       // Digital items are complete once paid — there is no logistics leg
-      this.prisma.orderItem.updateMany({
-        where: { orderId, fulfillmentStatus: 'PAID', product: { productType: 'DIGITAL' } },
-        data: { fulfillmentStatus: 'DELIVERED' },
-      }),
-      this.prisma.orderEvent.createMany({
-        data: [
-          { orderId, status: 'PAID', message: 'Payment confirmed' },
-          { orderId, status: 'PROCESSING', message: 'Seller is preparing your order' },
-        ],
-      }),
-      ...order.items.map((item) =>
-        this.prisma.product.update({
-          where: { id: item.productId },
-          data: { buyCount: { increment: item.quantity } },
-        }),
-      ),
-    ]);
+      await tx.orm.public.OrderItem
+        .where({ orderId, fulfillmentStatus: 'PAID' })
+        .where((i: any) => i.product.some({ productType: 'DIGITAL' }))
+        .update({ fulfillmentStatus: 'DELIVERED' });
+      await tx.orm.public.OrderEvent.createAll([
+        { orderId, status: 'PAID', message: 'Payment confirmed' },
+        { orderId, status: 'PROCESSING', message: 'Seller is preparing your order' },
+      ]);
+      // Prisma 8 has no { increment } in updates — read-then-write per item.
+      for (const item of order.items as any[]) {
+        const product = await tx.orm.public.Product
+          .where({ id: item.productId })
+          .select('buyCount')
+          .first();
+        if (product) {
+          await tx.orm.public.Product
+            .where({ id: item.productId })
+            .update({ buyCount: product.buyCount + item.quantity });
+        }
+      }
+    });
 
     return this.findOneForUserAdmin(orderId);
   }
 
   private async findOneForUserAdmin(orderId: string) {
-    const order = await this.prisma.order.findUnique({
-      where: { id: orderId },
-      include: {
-        items: { include: { product: { select: { id: true, name: true, slug: true, productType: true, images: true, sellerId: true } } } },
-        events: { orderBy: { createdAt: 'asc' } },
-      },
-    });
+    const order = await db.orm.public.Order
+      .include('items', (items: any) =>
+        items.include('product', (p: any) => p.select('id', 'name', 'slug', 'productType', 'images', 'sellerId')),
+      )
+      .include('events', (events: any) => events.orderBy((e: any) => e.createdAt.asc()))
+      .where({ id: orderId })
+      .first();
     return this.serializeOrder(order);
   }
 
