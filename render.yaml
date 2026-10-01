@@ -11,7 +11,9 @@ services:
     plan: free # spins down when idle; first request takes ~50s
     rootDir: kova-api # monorepo — the NestJS app lives here
     buildCommand: npm install && npm run build
-    startCommand: npx prisma migrate deploy && node dist/src/main.js
+    # Prisma 8: no migrate-on-boot. The schema on the shared DB is managed
+    # explicitly (npx prisma db … / contract flow) — the API starts directly.
+    startCommand: node dist/src/main.js
     healthCheckPath: /api/categories
     envVars:
       - key: NODE_ENV

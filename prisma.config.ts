@@ -14,7 +14,7 @@ export default definePrismaConfig({
     contract: prisma7Schema('prisma/schema.prisma'),
     output: 'src/generated/prisma8',
     db: {
-      connection: process.env.DATABASE_URL ?? '',
+      connection: process.env.DATABASE_URL ?? 'postgresql://localhost:5432/postgres',
     },
   }),
 });
