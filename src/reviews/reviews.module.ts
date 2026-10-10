@@ -20,7 +20,7 @@ import {
 import { IsString, IsNumber, IsOptional, Min, Max } from 'class-validator';
 import { Type } from 'class-transformer';
 import { PrismaService } from '../prisma/prisma.module';
-import { JwtAuthGuard, CurrentUser } from '../auth/auth.module';
+import { JwtAuthGuard, CurrentUser } from '../auth/index';
 
 // ── DTOs ──────────────────────────────────────────────────
 

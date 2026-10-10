@@ -23,7 +23,7 @@ import { Type } from 'class-transformer';
 import { createHmac } from 'crypto';
 import { PrismaService } from '../prisma/prisma.module';
 import { OrdersService } from '../orders/orders.module';
-import { JwtAuthGuard, CurrentUser } from '../auth/auth.module';
+import { JwtAuthGuard, CurrentUser } from '../auth/index';
 import type { Request } from 'express';
 
 // ── DTOs ──────────────────────────────────────────────────

@@ -18,7 +18,7 @@ import {
 } from '@nestjs/common';
 import { IsString, IsOptional } from 'class-validator';
 import { PrismaService } from '../prisma/prisma.module';
-import { JwtAuthGuard, CurrentUser } from '../auth/auth.module';
+import { JwtAuthGuard, CurrentUser } from '../auth/index';
 
 // ── DTOs ──────────────────────────────────────────────────
 
