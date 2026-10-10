@@ -13,6 +13,7 @@ import { CartModule } from './cart/cart.module';
 import { UploadsModule } from './uploads/uploads.module';
 import { ReviewsModule } from './reviews/reviews.module';
 import { PaystackModule } from './paystack/paystack.module';
+import { CategoriesModule } from './categories/categories.module';
 import { UsersModule } from './users/users.module';
 
 @Module({
@@ -28,6 +29,7 @@ import { UsersModule } from './users/users.module';
     UploadsModule,
     ReviewsModule,
     PaystackModule,
+    CategoriesModule,
   ],
 })
 export class AppModule {}

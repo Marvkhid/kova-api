@@ -22,7 +22,7 @@ import { IsNumber, IsString, Min } from 'class-validator';
 import { Type } from 'class-transformer';
 import { createHmac } from 'crypto';
 import { PrismaService } from '../prisma/prisma.module';
-import { OrdersService } from '../orders/orders.module';
+import { OrdersModule, OrdersService } from '../orders/orders.module';
 import { JwtAuthGuard, CurrentUser } from '../auth/index';
 import type { Request } from 'express';
 
@@ -173,9 +173,8 @@ export class PaystackController {
 // ── Module ────────────────────────────────────────────────
 
 @Module({
-  imports: [],
-  providers: [PaystackService],
+  imports: [OrdersModule], // provides OrdersService
   controllers: [PaystackController],
-  exports: [PaystackService],
+  providers: [PaystackService, OrdersService],
 })
 export class PaystackModule {}
