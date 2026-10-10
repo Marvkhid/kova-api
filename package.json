@@ -6,8 +6,8 @@
   "private": true,
   "license": "MIT",
   "scripts": {
-    "build": "npx prisma contract emit && node node_modules/rimraf/dist/esm/bin.mjs dist && nest build",
-    "start": "node dist/main",
+    "build": "npx prisma generate && node node_modules/rimraf/dist/esm/bin.mjs dist && nest build",
+    "start": "node dist/src/main.js",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\"",
